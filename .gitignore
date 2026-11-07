@@ -6,3 +6,4 @@
 driver/out/
 # capture logs
 *_log.txt
+dist/

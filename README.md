@@ -63,7 +63,29 @@ It is two parts:
   `bcdedit /set testsigning on` and a reboot. If BitLocker is on, have your recovery key ready
   before you change Secure Boot settings.
 
-## Building and installing
+## Installing
+
+Download from [Releases](https://github.com/toasty-wheeler/magic-mouse-windows/releases). Pair
+the mouse first, and make sure Secure Boot is off.
+
+- **Installer** (`MagicMouseNative-x.y.z-setup.exe`): installs the app and puts the driver on
+  the mouse. If test signing is off, setup offers to turn it on, and BitLocker is suspended for
+  that one restart. The mouse doesn't work until you restart, so restart with the keyboard if
+  you need to. Uninstall it from Windows' Apps settings; that also takes the driver off the mouse.
+- **Portable** (`MagicMouseNative-x.y.z-portable.zip`): unzip anywhere, run
+  `Install driver.cmd`, then `MagicMouseNative.exe`. Settings are saved in
+  `MagicMouseNative.ini` next to the app instead of the registry. The driver is still installed
+  in Windows, so run `Remove driver.cmd` before you delete the folder.
+
+Both trust the driver's test certificate ("MagicMouseNative Test") in the machine's
+certificate stores. That's how Windows accepts a test-signed driver package. Uninstalling
+removes the certificate again.
+
+**Don't turn test signing off while the driver is installed.** Windows checks the signature
+every time it loads the driver, so it would block it and the mouse would stop working until
+you turn test signing back on or remove the driver.
+
+## Building from source
 
 You need Visual Studio 2022 or later with Desktop development with C++, the Windows Driver Kit
 10.0.28000 and the Windows SDK 10.0.26100 (the WDK lacks the Bluetooth headers and signtool).
@@ -89,6 +111,11 @@ on the tray icon opens the window.
 
 To remove the driver, run `driver\uninstall.bat` as administrator.
 
+To make the installer and portable zip, also build `setup\build.bat` (mmdriver.exe, the
+install helper), then run `setup\package.bat`. It needs [Inno Setup](https://jrsoftware.org/isinfo.php)
+and writes to `dist\`. The packages contain the driver as you built and signed it, so its
+test certificate is yours.
+
 ## How it works
 
 ```
@@ -110,6 +137,8 @@ Magic Mouse ──Bluetooth──> BthEnum ──> mmfilter.sys ──> HidBth �
 
 ## Tools
 
+- `setup/mmdriver.exe`: installs (`install`), removes (`uninstall`) and checks (`status`) the
+  driver without WDK tools. The installer and the portable version use it.
 - `probe/`: checks whether touch reports reach user mode without the driver (they don't).
 - `tools/mmcapture`: logs touch frames to a text file. Close the app first.
 - `tools/mmreplay`: runs a capture through the gesture engine and prints the scrolling, clicks

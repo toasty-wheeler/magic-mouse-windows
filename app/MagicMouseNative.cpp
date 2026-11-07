@@ -11,7 +11,8 @@
 // click for middle down / up while two fingers are on the surface.
 //
 // The window (double-click the tray icon) shows the touches live and holds all settings;
-// they're saved in HKCU\Software\MagicMouseNative.
+// they're saved in HKCU\Software\MagicMouseNative, or in MagicMouseNative.ini next to the
+// exe if that file exists (the portable version).
 //
 // Build: build.bat (x64 Native Tools / Developer Command Prompt for VS).
 
@@ -157,34 +158,80 @@ enum ThemeMode { THEME_AUTO, THEME_LIGHT, THEME_DARK };
 static int  g_themeMode = THEME_AUTO;   // automatic follows Windows' app theme
 static bool g_onTop;
 
+// Settings store: HKCU\Software\MagicMouseNative, or for a portable copy (one with
+// MagicMouseNative.ini next to the exe) that file, so nothing is left on the PC.
+static std::wstring g_ini;      // the INI's path when portable
+static const wchar_t kIniSection[] = L"Settings";
+
+static void FindPortableIni() {
+    wchar_t p[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, p, MAX_PATH);
+    std::wstring ini(p, n);
+    ini = ini.substr(0, ini.find_last_of(L'\\') + 1) + kAppName + L".ini";
+    if (GetFileAttributesW(ini.c_str()) != INVALID_FILE_ATTRIBUTES) g_ini = ini;
+}
+
 static DWORD RegGetDword(HKEY k, const wchar_t* name, DWORD def) {
     DWORD v = 0, size = sizeof(v);
     return RegGetValueW(k, nullptr, name, RRF_RT_REG_DWORD, nullptr, &v, &size) == ERROR_SUCCESS ? v : def;
 }
 
+static DWORD StoreGet(const wchar_t* name, DWORD def) {
+    if (!g_ini.empty()) return GetPrivateProfileIntW(kIniSection, name, (INT)def, g_ini.c_str());
+    DWORD v = 0, size = sizeof(v);
+    return RegGetValueW(HKEY_CURRENT_USER, kRegKey, name, RRF_RT_REG_DWORD, nullptr, &v, &size) == ERROR_SUCCESS ? v : def;
+}
+
+static void StorePut(const wchar_t* name, DWORD v) {
+    if (!g_ini.empty()) {
+        WritePrivateProfileStringW(kIniSection, name, std::to_wstring(v).c_str(), g_ini.c_str());
+        return;
+    }
+    RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, name, REG_DWORD, &v, sizeof(v));
+}
+
+// Binary values; in the INI as hex. Returns the bytes read (0 if none).
+static DWORD StoreGetBinary(const wchar_t* name, void* data, DWORD size) {
+    if (g_ini.empty()) return RegGetValueW(HKEY_CURRENT_USER, kRegKey, name, RRF_RT_REG_BINARY, nullptr, data, &size) == ERROR_SUCCESS ? size : 0;
+    std::wstring hex(size * 2 + 2, L'\0');
+    DWORD len = GetPrivateProfileStringW(kIniSection, name, L"", hex.data(), (DWORD)hex.size(), g_ini.c_str());
+    DWORD n = 0;
+    for (; n < size && 2 * n + 1 < len; n++) ((BYTE*)data)[n] = (BYTE)wcstoul(hex.substr(2 * n, 2).c_str(), nullptr, 16);
+    return n;
+}
+
+static void StorePutBinary(const wchar_t* name, const void* data, DWORD size) {
+    if (g_ini.empty()) {
+        RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, name, REG_BINARY, data, size);
+        return;
+    }
+    std::wstring hex;
+    wchar_t b[3];
+    for (DWORD i = 0; i < size; i++) {
+        swprintf_s(b, L"%02X", ((const BYTE*)data)[i]);
+        hex += b;
+    }
+    WritePrivateProfileStringW(kIniSection, name, hex.c_str(), g_ini.c_str());
+}
+
 static void LoadSettings() {
-    HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegKey, 0, nullptr, 0, KEY_READ, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
-    *kEnabledSetting.value = RegGetDword(k, kEnabledSetting.reg, 1) != 0;
+    *kEnabledSetting.value = StoreGet(kEnabledSetting.reg, 1) != 0;
     for (const BoolSetting* list : { kGestureSettings, kScrollSettings }) {
         int n = list == kGestureSettings ? (int)ARRAYSIZE(kGestureSettings) : (int)ARRAYSIZE(kScrollSettings);
         for (int i = 0; i < n; i++) {
-            *list[i].value = RegGetDword(k, list[i].reg, *list[i].value) != 0;
-            if (list[i].invert) *list[i].invert = RegGetDword(k, list[i].invertReg, *list[i].invert) != 0;
+            *list[i].value = StoreGet(list[i].reg, *list[i].value) != 0;
+            if (list[i].invert) *list[i].invert = StoreGet(list[i].invertReg, *list[i].invert) != 0;
         }
     }
-    g_set.speed = (int)min(RegGetDword(k, L"Speed", 1), 2UL);
-    g_set.glide = (int)min(RegGetDword(k, L"Glide", 1), 2UL);
-    g_set.twoTapMs = (int)max((DWORD)kTwoTapFastestMs, min(RegGetDword(k, L"TwoTapMs", kTwoTapFastestMs), (DWORD)kTwoTapSlowestMs));
-    g_themeMode = (int)min(RegGetDword(k, L"Theme", THEME_AUTO), (DWORD)THEME_DARK);
-    g_onTop = RegGetDword(k, L"AlwaysOnTop", 0) != 0;
-    RegCloseKey(k);
+    g_set.speed = (int)min(StoreGet(L"Speed", 1), 2UL);
+    g_set.glide = (int)min(StoreGet(L"Glide", 1), 2UL);
+    g_set.twoTapMs = (int)max((DWORD)kTwoTapFastestMs, min(StoreGet(L"TwoTapMs", kTwoTapFastestMs), (DWORD)kTwoTapSlowestMs));
+    g_themeMode = (int)min(StoreGet(L"Theme", THEME_AUTO), (DWORD)THEME_DARK);
+    g_onTop = StoreGet(L"AlwaysOnTop", 0) != 0;
 }
 
 static void SaveSettings() {
-    HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
-    auto put = [&](const wchar_t* name, DWORD v) { RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE*)&v, sizeof(v)); };
+    auto put = StorePut;
     put(kEnabledSetting.reg, *kEnabledSetting.value);
     for (const BoolSetting* list : { kGestureSettings, kScrollSettings }) {
         int n = list == kGestureSettings ? (int)ARRAYSIZE(kGestureSettings) : (int)ARRAYSIZE(kScrollSettings);
@@ -198,7 +245,6 @@ static void SaveSettings() {
     put(L"TwoTapMs", (DWORD)g_set.twoTapMs);
     put(L"Theme", (DWORD)g_themeMode);
     put(L"AlwaysOnTop", g_onTop);
-    RegCloseKey(k);
 }
 
 static std::wstring ExePath() {
@@ -1705,8 +1751,8 @@ static ULONGLONG NowSeconds() {
 
 static void LoadBatteryHistory() {
     std::vector<BatterySample> samples(kBatterySamples);
-    DWORD size = (DWORD)(samples.size() * sizeof(BatterySample));
-    if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"BatteryHistory", RRF_RT_REG_BINARY, nullptr, samples.data(), &size) == ERROR_SUCCESS) {
+    DWORD size = StoreGetBinary(L"BatteryHistory", samples.data(), (DWORD)(samples.size() * sizeof(BatterySample)));
+    if (size) {
         samples.resize(size / sizeof(BatterySample));
         g_batteryHistory = samples;
     }
@@ -1726,12 +1772,7 @@ static void RecordBattery(int level) {
         LearnBatteryRate((now - g_batteryHistory.front().time) / 3600.0, g_batteryHistory.front().level - level);
     g_batteryHistory.push_back({ now, level });
     if (g_batteryHistory.size() > kBatterySamples) g_batteryHistory.erase(g_batteryHistory.begin());
-    HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
-        RegSetValueExW(k, L"BatteryHistory", 0, REG_BINARY, (const BYTE*)g_batteryHistory.data(),
-                       (DWORD)(g_batteryHistory.size() * sizeof(BatterySample)));
-        RegCloseKey(k);
-    }
+    StorePutBinary(L"BatteryHistory", g_batteryHistory.data(), (DWORD)(g_batteryHistory.size() * sizeof(BatterySample)));
 }
 
 // Battery life estimate, available straight away: it starts from a typical drain rate
@@ -1744,21 +1785,14 @@ static const double kConfidentAfterHours = 24;         // "About" instead of "Ro
 static double g_learnedHoursPerPercent;                // from the previous batteries, 0 if none
 
 static void LoadBatteryRate() {
-    DWORD tenths = 0, size = sizeof(tenths);
-    if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"BatteryTenthHoursPerPercent", RRF_RT_REG_DWORD, nullptr, &tenths, &size) == ERROR_SUCCESS)
-        g_learnedHoursPerPercent = tenths / 10.0;
+    g_learnedHoursPerPercent = StoreGet(L"BatteryTenthHoursPerPercent", 0) / 10.0;
 }
 
 // Remembers this battery's measured rate once there's enough of it, for the next batteries.
 static void LearnBatteryRate(double spanHours, double drop) {
     if (spanHours < 48 || drop < 3) return;
     g_learnedHoursPerPercent = spanHours / drop;
-    DWORD tenths = (DWORD)(g_learnedHoursPerPercent * 10);
-    HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
-        RegSetValueExW(k, L"BatteryTenthHoursPerPercent", 0, REG_DWORD, (const BYTE*)&tenths, sizeof(tenths));
-        RegCloseKey(k);
-    }
+    StorePut(L"BatteryTenthHoursPerPercent", (DWORD)(g_learnedHoursPerPercent * 10));
 }
 
 static std::wstring BatteryEstimate(int level) {
@@ -2340,6 +2374,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     CreateFonts();
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);        // taskbar progress
+    FindPortableIni();
     LoadSettings();
     LoadBatteryHistory();
     LoadBatteryRate();
