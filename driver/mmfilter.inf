@@ -1,0 +1,69 @@
+; mmfilter.inf - MagicMouseNative lower filter for Apple Magic Mouse 2009 (A1296, Bluetooth).
+;
+; Installs the inbox Bluetooth HID driver (hidbth.inf) on the mouse and adds mmfilter.sys
+; as a lower filter below HidBth.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %ProviderName%
+CatalogFile = mmfilter.cat
+DriverVer   = 01/01/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+mmfilter.sys = 1
+
+[Manufacturer]
+%ProviderName% = MagicMouseNative, NTamd64
+
+[MagicMouseNative.NTamd64]
+%MM1.DeviceDesc% = MM1_Inst, BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&030d
+%MM1.DeviceDesc% = MM1_Inst, BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&0310
+
+[MM1_Inst.NT]
+Include   = hidbth.inf
+Needs     = HIDBTH_Inst.NT
+CopyFiles = MM1_CopyFiles
+
+[MM1_CopyFiles]
+mmfilter.sys
+
+[MM1_Inst.NT.HW]
+Include = hidbth.inf
+Needs   = HIDBTH_Inst.NT.HW
+AddReg  = MM1_Filter_AddReg
+
+[MM1_Filter_AddReg]
+HKR,,"LowerFilters",0x00010000,"mmfilter"
+
+[MM1_Inst.NT.Services]
+Include    = hidbth.inf
+Needs      = HIDBTH_Inst.NT.Services
+AddService = mmfilter,,MM1_Filter_Service
+
+[MM1_Filter_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\mmfilter.sys
+
+[MM1_Inst.NT.Wdf]
+KmdfService = mmfilter, MM1_WdfSect
+
+[MM1_WdfSect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+ProviderName   = "MagicMouseNative"
+DiskName       = "MagicMouseNative Driver Disk"
+MM1.DeviceDesc = "Magic Mouse 2009 (MagicMouseNative)"
+ServiceDesc    = "MagicMouseNative Magic Mouse filter"

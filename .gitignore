@@ -1,0 +1,8 @@
+# build outputs
+*.exe
+*.obj
+*.pdb
+*.ilk
+driver/out/
+# capture logs
+*_log.txt
