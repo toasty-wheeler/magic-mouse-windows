@@ -40,6 +40,7 @@ static const wchar_t kApp[]      = L"MagicMouseNative.exe";
 static const wchar_t* const kHardwareIds[] = {
     L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&030d",
     L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&0310",
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0269",   // Magic Mouse 2
 };
 enum { EXIT_DONE = 0, EXIT_FAILED = 1, EXIT_SECURE_BOOT = 2, EXIT_NO_MOUSE = 3, EXIT_RESTART = 10 };
 

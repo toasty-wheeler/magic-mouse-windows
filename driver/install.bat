@@ -33,6 +33,7 @@ rem Force it onto the mouse; HidBth's generic match would otherwise compete on r
 set DEVCON=%ProgramFiles(x86)%\Windows Kits\10\Tools\10.0.28000.0\x64\devcon.exe
 "%DEVCON%" update mmfilter.inf "BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&030d"
 "%DEVCON%" update mmfilter.inf "BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&0310" >nul 2>nul
+"%DEVCON%" update mmfilter.inf "BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0269" >nul 2>nul
 
 rem Start the app again as the signed-in user (through Explorer), not elevated.
 if defined RESTART_APP if exist "%APP%" explorer.exe "%APP%"

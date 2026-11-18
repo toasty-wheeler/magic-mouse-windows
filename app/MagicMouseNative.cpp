@@ -756,6 +756,13 @@ static DWORD WINAPI HookThread(LPVOID) {
 
 static std::atomic<int> g_battery{-1};      // -1 = unknown
 
+// Mice mmfilter.sys supports: Magic Mouse 2009 (05AC:030D / 0310) and Magic Mouse 2, which
+// reports Apple's Bluetooth company ID as its vendor (004C:0269).
+static bool IsMagicMouse2(DWORD vid, DWORD pid) { return vid == 0x004C && pid == 0x0269; }
+static bool IsSupportedMouse(DWORD vid, DWORD pid) {
+    return (vid == 0x05AC && (pid == 0x030D || pid == 0x0310)) || IsMagicMouse2(vid, pid);
+}
+
 static int ReadBattery() {
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
@@ -777,12 +784,17 @@ static int ReadBattery() {
         HIDD_ATTRIBUTES at{ sizeof(at) };
         PHIDP_PREPARSED_DATA pp = nullptr;
         HIDP_CAPS caps{};
-        if (HidD_GetAttributes(h, &at) && at.VendorID == 0x05AC && (at.ProductID == 0x030D || at.ProductID == 0x0310) &&
+        if (HidD_GetAttributes(h, &at) && IsSupportedMouse(at.VendorID, at.ProductID) &&
             HidD_GetPreparsedData(h, &pp)) {
-            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS && caps.FeatureReportByteLength >= 2) {
+            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS && caps.FeatureReportByteLength >= 3) {
                 std::vector<BYTE> buf(caps.FeatureReportByteLength);
+                if (IsMagicMouse2(at.VendorID, at.ProductID)) {
+                    buf[0] = 0x90;                  // 90 status %
+                    if (HidD_GetFeature(h, buf.data(), (ULONG)buf.size())) level = min((int)buf[2], 100);
+                    ZeroMemory(buf.data(), buf.size());
+                }
                 buf[0] = 0x47;
-                if (HidD_GetFeature(h, buf.data(), (ULONG)buf.size())) level = min((int)buf[1], 100);
+                if (level < 0 && HidD_GetFeature(h, buf.data(), (ULONG)buf.size())) level = min((int)buf[1], 100);
             }
             HidD_FreePreparsedData(pp);
         }
@@ -1628,7 +1640,7 @@ static ULONGLONG FindMouseAddress() {
         HKEY k;
         if (RegOpenKeyExW(devices, name, 0, KEY_READ, &k) != ERROR_SUCCESS) continue;
         DWORD vid = RegGetDword(k, L"VID", 0), pid = RegGetDword(k, L"PID", 0);
-        if (vid == 0x05AC && (pid == 0x030D || pid == 0x0310)) address = wcstoull(name, nullptr, 16);
+        if (IsSupportedMouse(vid, pid)) address = wcstoull(name, nullptr, 16);
         RegCloseKey(k);
     }
     RegCloseKey(devices);
