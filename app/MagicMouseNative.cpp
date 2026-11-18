@@ -803,7 +803,10 @@ static bool EtwStart(TRACEHANDLE* session, TRACEHANDLE* trace) {
     }
     EVENT_TRACE_LOGFILEW log{};
     log.LoggerName = (LPWSTR)kEtwSession;
-    log.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    // RAW_TIMESTAMP: keep the session's QPC timestamps. Without it ETW hands them over converted
+    // to system time (FILETIME): frame-to-frame gaps still come out right (both 10 MHz here),
+    // but a glide, which compares a frame's time with QueryPerformanceCounter, never moves.
+    log.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
     log.EventRecordCallback = EtwEvent;
     *trace = OpenTraceW(&log);
     if (*trace == INVALID_PROCESSTRACE_HANDLE) {
@@ -1507,37 +1510,85 @@ static float DrawSectionLabel(gp::Graphics& g, float x, float y, float w, const 
     return y + S(24);
 }
 
-// Two-finger tap time limit slider, dragged with the mouse (see WindowProc).
+// Sliders, dragged with the mouse (see WindowProc): the two-finger tap time limit, and
+// Windows' pointer speed.
+enum SliderId { SLIDER_TAP, SLIDER_POINTER, SLIDER_COUNT };
 static const int kSliderRowH = 40;
-static gp::RectF g_sliderTrack;         // where the track was last drawn, for dragging
-static bool g_dragSlider;
+static gp::RectF g_sliderTrack[SLIDER_COUNT];   // where each track was last drawn, for dragging
+static int g_dragSlider = -1;                    // the slider being dragged
 
-static void SetTwoTapFromX(float x) {
-    float t = max(0.0f, min(1.0f, (x - g_sliderTrack.X) / max(1.0f, g_sliderTrack.Width)));
-    int ms = kTwoTapFastestMs + (int)(t * (kTwoTapSlowestMs - kTwoTapFastestMs) / 10 + 0.5f) * 10;
-    g_set.twoTapMs = ms;
+// Pointer speed is Windows' own (Settings > Mouse, 1-20, default 10), so it applies to every
+// mouse: with Apple's driver there's no driver of ours to scale just the Magic Mouse.
+static const int kPointerSlowest = 1, kPointerFastest = 20;
+static int g_pointerSpeed = 10;
+
+static void ReadPointerSpeed() {
+    int v = 0;
+    if (SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &v, 0) && v >= kPointerSlowest && v <= kPointerFastest) g_pointerSpeed = v;
 }
 
-static void DrawTapSlider(gp::Graphics& g, gp::RectF r) {
+// While dragging it applies at once; on release it's also saved (and other apps told).
+static void ApplyPointerSpeed(bool save) {
+    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)g_pointerSpeed, save ? SPIF_UPDATEINIFILE | SPIF_SENDCHANGE : 0);
+}
+
+static bool SliderEnabled(int id) { return id == SLIDER_POINTER || g_set.twoFingerTap; }
+
+static void SetSliderFromX(int id, float x) {
+    const gp::RectF& track = g_sliderTrack[id];
+    float t = max(0.0f, min(1.0f, (x - track.X) / max(1.0f, track.Width)));
+    if (id == SLIDER_TAP) {
+        g_set.twoTapMs = kTwoTapFastestMs + (int)(t * (kTwoTapSlowestMs - kTwoTapFastestMs) / 10 + 0.5f) * 10;
+        return;
+    }
+    int v = kPointerSlowest + (int)(t * (kPointerFastest - kPointerSlowest) + 0.5f);
+    if (v == g_pointerSpeed) return;
+    g_pointerSpeed = v;
+    ApplyPointerSpeed(false);
+}
+
+static void EndSliderDrag() {
+    if (g_dragSlider == SLIDER_POINTER) ApplyPointerSpeed(true);
+    else SaveSettings();
+    g_dragSlider = -1;
+}
+
+// A slider row: label, track (t: 0..1) and value text.
+static void DrawSlider(gp::Graphics& g, gp::RectF r, int id, const wchar_t* label, float t, const wchar_t* value) {
     const Palette& p = Pal();
-    bool on = g_set.twoFingerTap;
-    int e = AddElem(E_SLIDER, r, 0);
+    bool on = SliderEnabled(id);
+    int e = AddElem(E_SLIDER, r, id);
     gp::Color text = on ? p.subtext : WithAlpha(p.subtext, 110);
-    Label(g, L"Tap window", g_fonts.caption, text, gp::RectF(r.X + S(16), r.Y, S(72), r.Height));
-    wchar_t value[16];
-    swprintf_s(value, L"%.2f s", g_set.twoTapMs / 1000.0);
+    Label(g, label, g_fonts.caption, text, gp::RectF(r.X + S(16), r.Y, S(72), r.Height));
     Label(g, value, g_fonts.caption, text, gp::RectF(r.X + r.Width - S(16) - S(44), r.Y, S(44), r.Height),
           gp::StringAlignmentFar);
-    g_sliderTrack = gp::RectF(r.X + S(94), r.Y + r.Height / 2 - S(2), r.Width - S(94) - S(68), S(4));
-    float t = (float)(g_set.twoTapMs - kTwoTapFastestMs) / (kTwoTapSlowestMs - kTwoTapFastestMs);
-    float kx = g_sliderTrack.X + t * g_sliderTrack.Width, ky = r.Y + r.Height / 2;
-    FillRound(g, g_sliderTrack, S(2), p.switchOff);
-    FillRound(g, gp::RectF(g_sliderTrack.X, g_sliderTrack.Y, kx - g_sliderTrack.X, g_sliderTrack.Height), S(2),
-              on ? kAccent : p.line);
-    float kr = (Hovered(e) || g_dragSlider) && on ? S(10) : S(9);
+    gp::RectF& track = g_sliderTrack[id];
+    track = gp::RectF(r.X + S(94), r.Y + r.Height / 2 - S(2), r.Width - S(94) - S(68), S(4));
+    float kx = track.X + t * track.Width, ky = r.Y + r.Height / 2;
+    FillRound(g, track, S(2), p.switchOff);
+    FillRound(g, gp::RectF(track.X, track.Y, kx - track.X, track.Height), S(2), on ? kAccent : p.line);
+    float kr = (Hovered(e) || g_dragSlider == id) && on ? S(10) : S(9);
     gp::SolidBrush shadow(gp::Color(50, 0, 0, 0)), knob(on ? kWhite : Mix(kWhite, p.line, 0.5f));
     g.FillEllipse(&shadow, kx - kr, ky - kr + S(1), kr * 2, kr * 2);
     g.FillEllipse(&knob, kx - kr, ky - kr, kr * 2, kr * 2);
+}
+
+static void DrawTapSlider(gp::Graphics& g, gp::RectF r) {
+    wchar_t value[16];
+    swprintf_s(value, L"%.2f s", g_set.twoTapMs / 1000.0);
+    DrawSlider(g, r, SLIDER_TAP, L"Tap window",
+               (float)(g_set.twoTapMs - kTwoTapFastestMs) / (kTwoTapSlowestMs - kTwoTapFastestMs), value);
+}
+
+// Pointer speed in a card of its own (under the gestures).
+static float DrawPointerCard(gp::Graphics& g, float x, float y, float w) {
+    gp::RectF card(x, y, w, S(kSliderRowH));
+    FillRound(g, card, S(12), Pal().card);
+    wchar_t value[16];
+    swprintf_s(value, L"%d", g_pointerSpeed);
+    DrawSlider(g, card, SLIDER_POINTER, L"Speed",
+               (float)(g_pointerSpeed - kPointerSlowest) / (kPointerFastest - kPointerSlowest), value);
+    return y + card.Height;
 }
 
 // A card of switch rows; sliderAfter puts the tap-window slider under that row (-1: none).
@@ -2383,17 +2434,21 @@ static void PaintWindow(HWND hwnd, HDC target) {
 
         static const wchar_t* const speeds[] = { L"Slow", L"Normal", L"Fast" };
         static const wchar_t* const glides[] = { L"Short", L"Normal", L"Long" };
-        float columnH = S(24) + S(kRowH) * kGestureCount + S(kSliderRowH) + S(20) + S(24) + S(34);   // the taller (left) column
+        float leftH = S(24) + S(kRowH) * kGestureCount + S(kSliderRowH) + S(20) + S(24) + S(kSliderRowH);
+        float rightH = S(24) + S(kRowH) * kScrollCount + 2 * (S(20) + S(24) + S(34));
+        float columnH = max(leftH, rightH);
         float y0 = top + max(0.0f, (bottom - top - columnH) / 2);
 
         float y = DrawSectionLabel(g, lx, y0, sideW, L"GESTURES");
         y = DrawToggleCard(g, lx, y, sideW, kGestureSettings, kGestureCount, 0, 1);   // slider under two-finger tap
-        y = DrawSectionLabel(g, lx, y + S(20), sideW, L"SCROLL SPEED");
-        DrawSegmented(g, gp::RectF(lx, y, sideW, S(34)), SEG_SPEED, speeds, g_set.speed);
+        y = DrawSectionLabel(g, lx, y + S(20), sideW, L"POINTER SPEED \x00B7 ALL MICE");
+        DrawPointerCard(g, lx, y, sideW);
 
         y = DrawSectionLabel(g, rx, y0, sideW, L"SCROLLING");
         y = DrawToggleCard(g, rx, y, sideW, kScrollSettings, kScrollCount, kGestureCount);
-        y = DrawSectionLabel(g, rx, y + S(20), sideW, L"GLIDE LENGTH");
+        y = DrawSectionLabel(g, rx, y + S(20), sideW, L"SCROLL SPEED");
+        DrawSegmented(g, gp::RectF(rx, y, sideW, S(34)), SEG_SPEED, speeds, g_set.speed);
+        y = DrawSectionLabel(g, rx, y + S(34) + S(20), sideW, L"GLIDE LENGTH");
         DrawSegmented(g, gp::RectF(rx, y, sideW, S(34)), SEG_GLIDE, glides, g_set.glide);
 
         DrawTouchViewLayered(g, layout, v, fresh, g_clickL, g_clickR);
@@ -2549,6 +2604,7 @@ static bool Animating() {
 
 static void ShowWindowFront() {
     g_startup = StartsWithWindows();
+    ReadPointerSpeed();             // it may have been changed in Windows' settings
     ShowWindow(g_window, SW_SHOWNORMAL);
     SetForegroundWindow(g_window);
     SetTimer(g_window, 1, 16, nullptr);     // repaint ~60 fps while shown (touches, animations)
@@ -2569,8 +2625,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (Animating()) InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_MOUSEMOVE: {
-        if (g_dragSlider) {
-            SetTwoTapFromX((float)GET_X_LPARAM(lp));
+        if (g_dragSlider >= 0) {
+            SetSliderFromX(g_dragSlider, (float)GET_X_LPARAM(lp));
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -2598,21 +2654,22 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_renameEdit) SetFocus(hwnd);
         g_pressed = HitTest(lp);
         SetCapture(hwnd);
-        if (g_pressed >= 0 && g_elems[g_pressed].kind == E_SLIDER && g_set.twoFingerTap && !g_themeOpen) {
-            g_dragSlider = true;            // jump to the press, then follow the drag
-            SetTwoTapFromX((float)GET_X_LPARAM(lp));
+        if (g_pressed >= 0 && g_elems[g_pressed].kind == E_SLIDER && SliderEnabled(g_elems[g_pressed].id) && !g_themeOpen) {
+            g_dragSlider = g_elems[g_pressed].id;      // jump to the press, then follow the drag
+            SetSliderFromX(g_dragSlider, (float)GET_X_LPARAM(lp));
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     case WM_LBUTTONUP: {
-        ReleaseCapture();
-        InvalidateRect(hwnd, nullptr, FALSE);
-        if (g_dragSlider) {
-            g_dragSlider = false;
+        if (g_dragSlider >= 0) {
+            EndSliderDrag();                // before ReleaseCapture, whose WM_CAPTURECHANGED would end it too
+            ReleaseCapture();
+            InvalidateRect(hwnd, nullptr, FALSE);
             g_pressed = -1;
-            SaveSettings();
             return 0;
         }
+        ReleaseCapture();
+        InvalidateRect(hwnd, nullptr, FALSE);
         int hit = HitTest(lp);
         bool same = hit >= 0 && hit == g_pressed;
         g_pressed = -1;
@@ -2641,12 +2698,13 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_SETTINGCHANGE:
         if (lp && !lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") && g_themeMode == THEME_AUTO) ApplyTheme();
+        if (wp == SPI_SETMOUSESPEED && g_dragSlider != SLIDER_POINTER) {     // changed in Windows' settings
+            ReadPointerSpeed();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
     case WM_CAPTURECHANGED:
-        if (g_dragSlider && (HWND)lp != hwnd) {     // capture taken away mid-drag
-            g_dragSlider = false;
-            SaveSettings();
-        }
+        if (g_dragSlider >= 0 && (HWND)lp != hwnd) EndSliderDrag();      // capture taken away mid-drag
         return 0;
     case WM_CLOSE:          // hide; the app keeps running in the tray
         KillTimer(hwnd, 1);
