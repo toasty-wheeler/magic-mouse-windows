@@ -2,19 +2,36 @@
 // Bluetooth packet log (ETW, BTHPORT event 402) for a while and decodes touch frames with
 // app\hciraw.h, as the app does. Works with mmfilter or Apple's driver on the mouse (either
 // one puts it in multi-touch mode). Run as administrator, touching the mouse:
-//   btcapture [seconds]        (default 15)
+//   btcapture [seconds]        (default 15; the output is also saved to btcapture_log.txt)
 // Build: cl /nologo /EHsc /W4 /std:c++17 btcapture.cpp
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <evntrace.h>
 #include <evntcons.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include "..\app\hciraw.h"
 
 #pragma comment(lib, "advapi32.lib")
+
+// Everything printed also goes to btcapture_log.txt next to the exe.
+static FILE* g_log;
+static void Out(const char* fmt, ...) {
+    va_list a;
+    va_start(a, fmt);
+    vprintf(fmt, a);
+    va_end(a);
+    if (g_log) {
+        va_start(a, fmt);
+        vfprintf(g_log, fmt, a);
+        va_end(a);
+        fflush(g_log);
+    }
+}
+#define printf Out
 
 static const wchar_t kSession[] = L"MagicMouseNative btcapture";
 static const GUID kBthPort = { 0x8a1f9517, 0x3a8c, 0x4a9e, { 0xa0, 0x18, 0x4f, 0x17, 0xa2, 0x00, 0xf2, 0x77 } };
@@ -79,6 +96,11 @@ static DWORD WINAPI Process(LPVOID trace) {
 
 int wmain(int argc, wchar_t** argv) {
     int seconds = argc > 1 ? _wtoi(argv[1]) : 15;
+    wchar_t logPath[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, logPath, MAX_PATH);
+    while (n && logPath[n - 1] != L'\\') n--;
+    wcscpy_s(logPath + n, MAX_PATH - n, L"btcapture_log.txt");
+    _wfopen_s(&g_log, logPath, L"w");
     std::vector<BYTE> props = Props();
     ControlTraceW(0, kSession, (EVENT_TRACE_PROPERTIES*)props.data(), EVENT_TRACE_CONTROL_STOP);
     props = Props();
@@ -124,5 +146,11 @@ int wmain(int argc, wchar_t** argv) {
     if (!g_events) printf("No Bluetooth events at all: the provider didn't log anything.\n");
     else if (g_scrubbed && !g_frames) printf("Windows blanks the packets: EtwLogSensitiveData=1 is needed (mmdriver bootcamp).\n");
     else if (!g_frames) printf("No touch frames: was the mouse touched, and is it in multi-touch mode?\n");
+    printf("\n(saved to %ls)\n", logPath);
+    if (g_log) fclose(g_log);
+    if (GetConsoleProcessList(&n, 1) == 1) {     // its own window (e.g. Run as administrator): keep it open
+        printf("Press Enter to close.");
+        getchar();
+    }
     return g_frames ? 0 : 2;
 }
