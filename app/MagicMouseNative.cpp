@@ -756,9 +756,10 @@ static DWORD WINAPI HookThread(LPVOID) {
 
 static std::atomic<int> g_battery{-1};      // -1 = unknown
 
-// Mice mmfilter.sys supports: Magic Mouse 2009 (05AC:030D / 0310) and Magic Mouse 2, which
-// reports Apple's Bluetooth company ID as its vendor (004C:0269).
-static bool IsMagicMouse2(DWORD vid, DWORD pid) { return vid == 0x004C && pid == 0x0269; }
+// Mice mmfilter.sys supports: Magic Mouse 2009 (05AC:030D / 0310), and Magic Mouse 2 and the
+// USB-C Magic Mouse, which report Apple's Bluetooth company ID as their vendor (004C:0269 /
+// 004C:0323) and share a protocol.
+static bool IsMagicMouse2(DWORD vid, DWORD pid) { return vid == 0x004C && (pid == 0x0269 || pid == 0x0323); }
 static bool IsSupportedMouse(DWORD vid, DWORD pid) {
     return (vid == 0x05AC && (pid == 0x030D || pid == 0x0310)) || IsMagicMouse2(vid, pid);
 }
@@ -786,13 +787,14 @@ static int ReadBattery() {
         HIDP_CAPS caps{};
         if (HidD_GetAttributes(h, &at) && IsSupportedMouse(at.VendorID, at.ProductID) &&
             HidD_GetPreparsedData(h, &pp)) {
-            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS && caps.FeatureReportByteLength >= 3) {
+            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS && IsMagicMouse2(at.VendorID, at.ProductID) &&
+                caps.InputReportByteLength >= 3) {
+                std::vector<BYTE> in(caps.InputReportByteLength);
+                in[0] = 0x90;                       // input report: 90 status %
+                if (HidD_GetInputReport(h, in.data(), (ULONG)in.size()) && in[0] == 0x90) level = min((int)in[2], 100);
+            }
+            if (level < 0 && caps.FeatureReportByteLength >= 2) {
                 std::vector<BYTE> buf(caps.FeatureReportByteLength);
-                if (IsMagicMouse2(at.VendorID, at.ProductID)) {
-                    buf[0] = 0x90;                  // 90 status %
-                    if (HidD_GetFeature(h, buf.data(), (ULONG)buf.size())) level = min((int)buf[2], 100);
-                    ZeroMemory(buf.data(), buf.size());
-                }
                 buf[0] = 0x47;
                 if (level < 0 && HidD_GetFeature(h, buf.data(), (ULONG)buf.size())) level = min((int)buf[1], 100);
             }

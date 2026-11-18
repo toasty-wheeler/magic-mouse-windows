@@ -1,5 +1,5 @@
 ; mmfilter.inf - MagicMouseNative lower filter for Apple Magic Mouse 2009 (A1296) and
-; Magic Mouse 2 (A1657), Bluetooth.
+; Magic Mouse 2 (A1657) / USB-C Magic Mouse, Bluetooth.
 ;
 ; Installs the inbox Bluetooth HID driver (hidbth.inf) on the mouse and adds mmfilter.sys
 ; as a lower filter below HidBth.
@@ -29,6 +29,7 @@ mmfilter.sys = 1
 %MM1.DeviceDesc% = MM1_Inst, BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&030d
 %MM1.DeviceDesc% = MM1_Inst, BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&0310
 %MM2.DeviceDesc% = MM1_Inst, BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0269
+%MM3.DeviceDesc% = MM1_Inst, BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0323
 
 [MM1_Inst.NT]
 Include   = hidbth.inf
@@ -69,4 +70,5 @@ ProviderName   = "MagicMouseNative"
 DiskName       = "MagicMouseNative Driver Disk"
 MM1.DeviceDesc = "Magic Mouse 2009 (MagicMouseNative)"
 MM2.DeviceDesc = "Magic Mouse 2 (MagicMouseNative)"
+MM3.DeviceDesc = "Magic Mouse USB-C (MagicMouseNative)"
 ServiceDesc    = "MagicMouseNative Magic Mouse filter"

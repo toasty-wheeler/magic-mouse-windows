@@ -39,12 +39,15 @@
 #define MM_BATTERY_FIRST_MS  2000    // first battery read after connecting
 #define MM_BATTERY_POLL_MS   60000
 #define HIDP_GET_FEATURE     0x43    // GET_REPORT | Feature
+#define HIDP_GET_INPUT       0x41    // GET_REPORT | Input
 #define HIDP_DATA_FEATURE    0xA3    // DATA | Feature
 #define MM_REPORT_BATTERY    0x47    // feature: Battery Strength, 0-100 %
-// Magic Mouse 2 (BT VID 004C, PID 0269), as Linux hid-magicmouse drives it: multi-touch on
-// with SET_REPORT(Feature) F1 02 01; stock and multi-touch input share report 0x12 ("12
-// buttons X X Y Y 0 0" stock, 14-byte header + 8 bytes per touch in multi-touch mode, the
-// touches laid out as on the 2009 mouse). Battery is feature 0x90 (status, %).
+// Magic Mouse 2 (BT VID 004C, PID 0269) and the USB-C Magic Mouse (PID 0323) speak the same
+// protocol, as Linux hid-magicmouse drives them: multi-touch on with SET_REPORT(Feature)
+// F1 02 01; stock and multi-touch input share report 0x12 ("12 buttons X X Y Y 0 0" stock,
+// 14-byte header + 8 bytes per touch in multi-touch mode, the touches laid out as on the
+// 2009 mouse; two may come packed in 0xF7). Battery is input report 0x90 (status, %), read
+// with GET_REPORT(Input) and also sent unasked.
 #define MM2_REPORT_MOUSE     0x12
 #define MM2_STOCK_LEN        8       // report 0x12 without touches, ID included
 #define MM2_HEADER_LEN       14
@@ -63,8 +66,8 @@ typedef struct _MM_FILTER_CONTEXT {
     WDFIOTARGET Target;
     BTH_PROFILE_DRIVER_INTERFACE Bth;
     BOOLEAN     HaveBth;
-    BOOLEAN     Mm2;                    // Magic Mouse 2 (hardware ID has PID&0269)
-    UCHAR       BatteryReport;          // feature report to read the battery from
+    BOOLEAN     Mm2;                    // Magic Mouse 2 or USB-C (hardware ID has PID&0269/0323)
+    UCHAR       BatteryReport;          // report to read the battery from (0x90 input, 0x47 feature)
     WDFTIMER    EnableTimer;
     WDFTIMER    CdoTimer;               // passive level: retries creating the control device
 
@@ -544,7 +547,7 @@ static BOOLEAN MmIsOurReply(PMM_FILTER_CONTEXT c, const UCHAR* Buf, ULONG Len)
     } else if (c->OurRequest == MM_REQ_BATTERY && Len >= 3 && Buf[0] == HIDP_DATA_FEATURE &&
                Buf[1] == MM_REPORT_BATTERY) {
         c->Battery = min(Buf[2], 100);
-    } else if (c->OurRequest == MM_REQ_BATTERY && Len >= 4 && Buf[0] == HIDP_DATA_FEATURE &&
+    } else if (c->OurRequest == MM_REQ_BATTERY && Len >= 4 && Buf[0] == HIDP_DATA_INPUT &&
                Buf[1] == MM2_REPORT_BATTERY) {
         c->Battery = min(Buf[3], 100);          // 90 status %
     } else if (c->OurRequest == MM_REQ_BATTERY && Buf[0] != HIDP_HANDSHAKE &&
@@ -614,7 +617,8 @@ static BOOLEAN MmSendRequest(PMM_FILTER_CONTEXT c, UCHAR Request)
         c->SendBuf[2] = 0x01;
         len = 3;
     } else {
-        c->SendBuf[0] = HIDP_GET_FEATURE;
+        // MM2 / USB-C: input report 0x90 (the feature form isn't answered reliably over BT).
+        c->SendBuf[0] = c->BatteryReport == MM2_REPORT_BATTERY ? HIDP_GET_INPUT : HIDP_GET_FEATURE;
         c->SendBuf[1] = c->BatteryReport;
         len = 2;
     }
@@ -810,36 +814,66 @@ static UCHAR MmSwapButtons(UCHAR b)
     return (UCHAR)(((b & 1) << 1) | ((b & 2) >> 1));
 }
 
-// Magic Mouse 2 report 0x12. A multi-touch one is queued for the app converted to the 2009
-// mouse's 0x29 (motion clamped to its 10 bits; the touch records are the same), so the app
-// handles both mice alike. Every 0x12 goes to HidBth as the stock 8-byte form.
+// One Magic Mouse 2 / USB-C report 0x12 (r, n: ID included). A multi-touch one is queued for
+// the app converted to the 2009 mouse's 0x29 (motion clamped to its 10 bits; the touch
+// records are the same), so the app handles every mouse alike. Adds its motion to X, Y.
+// Returns FALSE if it isn't a 0x12.
+static BOOLEAN MmQueueMm2Report(const UCHAR* r, ULONG n, LONG* X, LONG* Y, UCHAR* Buttons, BOOLEAN* Touch)
+{
+    UCHAR frame[MM_MAX_REPORT];
+    ULONG touches, i;
+    LONG x, y;
+
+    if (n < MM2_STOCK_LEN || r[0] != MM2_REPORT_MOUSE) return FALSE;
+    x = (SHORT)(r[2] | (r[3] << 8));
+    y = (SHORT)(r[4] | (r[5] << 8));
+    *X += x;
+    *Y += y;
+    *Buttons = r[1] & 0x03;
+    if (n < MM2_HEADER_LEN || (n - MM2_HEADER_LEN) % 8 != 0) return TRUE;   // stock form
+
+    *Touch = TRUE;
+    touches = min((n - MM2_HEADER_LEN) / 8, MM_MAX_TOUCHES);
+    x = max(-511, min(511, x));
+    y = max(-511, min(511, y));
+    frame[0] = MM_REPORT_TOUCH;
+    frame[1] = (UCHAR)x;
+    frame[2] = (UCHAR)y;
+    frame[3] = (UCHAR)(*Buttons | (((x >> 8) & 0x03) << 2) | (((y >> 8) & 0x03) << 4));
+    frame[4] = frame[5] = 0;
+    for (i = 0; i < touches * 8; i++) frame[6 + i] = r[MM2_HEADER_LEN + i];
+    MmPushFrame(frame, 6 + touches * 8);
+    return TRUE;
+}
+
+// Magic Mouse 2 / USB-C interrupt packets: 0x12 (or two packed in 0xF7) are queued as above
+// and go to HidBth as one stock "A1 12 buttons X X Y Y 0 0". Returns 0 to drop the packet,
+// or Len unchanged if it isn't one of these.
 static ULONG MmTranslateMm2(PMM_FILTER_CONTEXT c, L2CAP_CHANNEL_HANDLE Channel, PUCHAR Buf, ULONG Len)
 {
-    const UCHAR* r = Buf + 1;
-    ULONG n = Len - 1, touches, i;
-    UCHAR frame[MM_MAX_REPORT];
-    UCHAR buttons = r[1] & 0x03;
-    LONG x = (SHORT)(r[2] | (r[3] << 8));
-    LONG y = (SHORT)(r[4] | (r[5] << 8));
-    BOOLEAN touch = n >= MM2_HEADER_LEN && (n - MM2_HEADER_LEN) % 8 == 0;
+    LONG x = 0, y = 0;
+    UCHAR buttons = 0;
+    BOOLEAN touch = FALSE, any;
 
-    MmNoteInterrupt(c, Channel, touch);
-    if (touch) {
-        touches = min((n - MM2_HEADER_LEN) / 8, MM_MAX_TOUCHES);
-        x = max(-511, min(511, x));
-        y = max(-511, min(511, y));
-        frame[0] = MM_REPORT_TOUCH;
-        frame[1] = (UCHAR)x;
-        frame[2] = (UCHAR)y;
-        frame[3] = (UCHAR)(buttons | (((x >> 8) & 0x03) << 2) | (((y >> 8) & 0x03) << 4));
-        frame[4] = frame[5] = 0;
-        for (i = 0; i < touches * 8; i++) frame[6 + i] = r[MM2_HEADER_LEN + i];
-        MmPushFrame(frame, 6 + touches * 8);
+    if (Buf[1] == MM_REPORT_DOUBLE && Len >= 3 && Buf[2] <= Len - 3) {
+        any = MmQueueMm2Report(Buf + 3, Buf[2], &x, &y, &buttons, &touch);
+        any |= MmQueueMm2Report(Buf + 3 + Buf[2], Len - 3 - Buf[2], &x, &y, &buttons, &touch);
+        if (!any) return Len;
+    } else if (!MmQueueMm2Report(Buf + 1, Len - 1, &x, &y, &buttons, &touch)) {
+        return Len;
     }
+    MmNoteInterrupt(c, Channel, touch);
 
     buttons = MmSwapButtons(buttons);
     c->PhysButtons = buttons;
+    x = max(-32768, min(32767, x));
+    y = max(-32768, min(32767, y));
+    Buf[1] = MM2_REPORT_MOUSE;
     Buf[2] = buttons;
+    Buf[3] = (UCHAR)x;
+    Buf[4] = (UCHAR)(x >> 8);
+    Buf[5] = (UCHAR)y;
+    Buf[6] = (UCHAR)(y >> 8);
     Buf[7] = Buf[8] = 0;
     return 1 + MM2_STOCK_LEN;
 }
@@ -854,7 +888,15 @@ static ULONG MmTranslateInput(PMM_FILTER_CONTEXT c, L2CAP_CHANNEL_HANDLE Channel
     BOOLEAN any = FALSE;
 
     if (Len < 2 || Buf[0] != HIDP_DATA_INPUT) return Len;
-    if (c->Mm2 && Buf[1] == MM2_REPORT_MOUSE && Len >= 1 + MM2_STOCK_LEN) return MmTranslateMm2(c, Channel, Buf, Len);
+    if (c->Mm2 && (Buf[1] == MM2_REPORT_MOUSE || Buf[1] == MM_REPORT_DOUBLE)) {
+        ULONG out = MmTranslateMm2(c, Channel, Buf, Len);
+        if (out != Len || Buf[1] == MM2_REPORT_MOUSE) return out;
+    }
+    if (c->Mm2 && Buf[1] == MM2_REPORT_BATTERY && Len >= 4) {
+        WdfSpinLockAcquire(c->Lock);
+        c->Battery = min(Buf[3], 100);          // sent unasked: 90 status %
+        WdfSpinLockRelease(c->Lock);
+    }
     if (Buf[1] == MM_REPORT_MOUSE) {
         MmNoteInterrupt(c, Channel, FALSE);
         if (Len >= 3) {
@@ -1427,13 +1469,14 @@ VOID MmEvtFilterCleanup(WDFOBJECT Object)
     if (c->HaveBth) c->Bth.Interface.InterfaceDereference(c->Bth.Interface.Context);
 }
 
-// TRUE if one of the device's hardware IDs names the Magic Mouse 2 ("...PID&0269").
+// TRUE if one of the device's hardware IDs names a mouse that speaks the Magic Mouse 2
+// protocol: Magic Mouse 2 ("...PID&0269") or the USB-C Magic Mouse ("...PID&0323").
 static BOOLEAN MmIsMagicMouse2(PWDFDEVICE_INIT DeviceInit)
 {
-    static const WCHAR pid[] = L"PID&0269";
-    const ULONG pidLen = ARRAYSIZE(pid) - 1;
+    static const WCHAR* const pids[] = { L"PID&0269", L"PID&0323" };
+    const ULONG pidLen = 8;
     WDFMEMORY memory;
-    size_t size, chars, i, j;
+    size_t size, chars, i, j, k;
     PCWSTR ids;
     BOOLEAN found = FALSE;
 
@@ -1443,9 +1486,11 @@ static BOOLEAN MmIsMagicMouse2(PWDFDEVICE_INIT DeviceInit)
     }
     ids = (PCWSTR)WdfMemoryGetBuffer(memory, &size);
     chars = size / sizeof(WCHAR);
-    for (i = 0; !found && i + pidLen <= chars; i++) {     // MULTI_SZ: NULs never match
-        for (j = 0; j < pidLen && RtlUpcaseUnicodeChar(ids[i + j]) == pid[j]; j++) {}
-        found = j == pidLen;
+    for (k = 0; !found && k < ARRAYSIZE(pids); k++) {
+        for (i = 0; !found && i + pidLen <= chars; i++) {     // MULTI_SZ: NULs never match
+            for (j = 0; j < pidLen && RtlUpcaseUnicodeChar(ids[i + j]) == pids[k][j]; j++) {}
+            found = j == pidLen;
+        }
     }
     WdfObjectDelete(memory);
     return found;
