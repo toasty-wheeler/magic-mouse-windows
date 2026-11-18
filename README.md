@@ -51,10 +51,27 @@ It is two parts:
 - Shows when the mouse is asleep or searching, and lets you rename the mouse's Bluetooth name.
 - Light, dark or automatic theme; always on top; start with Windows.
 
+**Apple keyboards** (after [MacKeys](https://github.com/dooperdrew/mackeys-win); not yet tested
+on a real keyboard)
+- Works with Magic Keyboards (with and without the numeric keypad or Touch ID), the Apple
+  Wireless Keyboard and the wired Apple Keyboard, over USB or Bluetooth. Only active while one
+  is connected, so other keyboards are never changed.
+- Windows never reports the Fn key, so **Right Option is Fn**: Fn + arrows = Home / End /
+  Page Up / Page Down, Fn + Backspace = Delete, Fn + Return = Insert.
+- Top row: media keys first (Task View, Start, previous / play / next, mute, volume) with Fn for
+  F1-F12, or the other way round. Fn + Esc switches.
+- Command and Option swapped, so Alt and Windows sit where a PC keyboard has them.
+- F13 / F14 / F15 = Print Screen / Scroll Lock / Pause.
+- On AltGr layouts, the extra Left Ctrl Windows sends with Right Alt is dropped.
+- Keyboard battery in the tray tooltip and menu, with a low-battery notice.
+- Every option is in the tray menu under **Apple keyboard**.
+
 ## Requirements
 
-- The **2009 Magic Mouse (A1296)**, paired over Bluetooth. The Magic Mouse 2 and later are a
-  different device and aren't supported.
+- The **2009 Magic Mouse (A1296)**, paired over Bluetooth. The Magic Mouse 2 (A1657) and the
+  USB-C Magic Mouse are also recognised over Bluetooth, but that support hasn't been tested on
+  real hardware yet.
+- An Apple keyboard is optional; its remapping needs no driver.
 - 64-bit Windows 10 or 11.
 - Remove other Magic Mouse drivers first (Magic Utilities, Apple Boot Camp's
   `applewirelessmouse`), because they sit on the same device.
@@ -143,6 +160,8 @@ Magic Mouse ──Bluetooth──> BthEnum ──> mmfilter.sys ──> HidBth �
 - `tools/mmcapture`: logs touch frames to a text file. Close the app first.
 - `tools/mmreplay`: runs a capture through the gesture engine and prints the scrolling, clicks
   and how quickly each stroke started scrolling. Use it to tune gestures without the mouse.
+- `tools/kbtest`: checks the Apple keyboard remapping ([app/keyboard.h](app/keyboard.h))
+  without a keyboard, and lists the keyboards on the PC.
 
 ## Limitations
 
@@ -152,3 +171,6 @@ Magic Mouse ──Bluetooth──> BthEnum ──> mmfilter.sys ──> HidBth �
 - Some games with anti-cheat ignore injected input, so game mode and held buttons may not work
   in those games.
 - The driver is test-signed only.
+- Keyboard remapping applies to every keyboard while an Apple keyboard is connected: a
+  low-level hook can't tell which keyboard a key came from. The physical Fn and Eject keys
+  can't be used (Windows drops them).

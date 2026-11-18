@@ -10,6 +10,10 @@
 // click, and the stock report has no middle button, so a low-level mouse hook swaps that
 // click for middle down / up while two fingers are on the surface.
 //
+// Apple keyboards (keyboard.h, after MacKeys): while one is connected, a low-level keyboard
+// hook gives it a Fn layer on Right Option, swaps Command and Option, puts media keys on the
+// top row and F13-F15 to use; its battery shows in the tray. Settings: the tray menu.
+//
 // The window (double-click the tray icon) shows the touches live and holds all settings;
 // they're saved in HKCU\Software\MagicMouseNative, or in MagicMouseNative.ini next to the
 // exe if that file exists (the portable version).
@@ -34,6 +38,7 @@
 #include <string>
 #include <vector>
 #include "engine.h"
+#include "keyboard.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -59,6 +64,9 @@ static const UINT    WM_TRAYDOT   = WM_APP + 4;   // wParam: 1 button held, 0 re
 static const UINT    WM_MIDDLEBUTTON = WM_APP + 5;   // wParam: 1 press, 0 release (from the mouse hook)
 static const UINT    WM_MOUSESTATE = WM_APP + 6;     // g_mouseState changed
 static const UINT    WM_RESTORECURSOR = WM_APP + 7;  // after a pinch: wParam x, lParam y
+static const UINT    WM_KBTOGGLE   = WM_APP + 8;     // Fn + Esc: switch the keyboard's top row
+static const UINT    WM_KBSTATE    = WM_APP + 9;     // Apple keyboard connected / gone / battery
+static const UINT    WM_KBRELEASE  = WM_APP + 10;    // to the keyboard hook thread: let go of held keys
 static const DWORD   kStatusPollMs   = 2000;        // driver status (mouse state, battery)
 static const DWORD   kBatteryPollMs  = 60000;
 static const DWORD   kBatteryRetryMs = 10000;
@@ -123,6 +131,29 @@ struct Settings {
     }
 };
 static Settings g_set;
+
+// Apple keyboard remapping (keyboard.h); applies only while an Apple keyboard is connected.
+struct KeyboardSettings {
+    std::atomic<bool> enabled{true};
+    std::atomic<bool> fnKey{true};
+    std::atomic<bool> swapCmdOption{true};
+    std::atomic<bool> mediaFirst{true};
+    std::atomic<bool> extraKeys{true};
+
+    KbConfig Snapshot() const {
+        KbConfig c;
+        c.fnKey = fnKey;
+        c.swapCmdOption = swapCmdOption;
+        c.mediaFirst = mediaFirst;
+        c.extraKeys = extraKeys;
+        return c;
+    }
+};
+static KeyboardSettings g_kb;
+static const struct { std::atomic<bool>* value; const wchar_t* reg; } kKeyboardSettings[] = {
+    { &g_kb.enabled, L"KbEnabled" }, { &g_kb.fnKey, L"KbFnKey" }, { &g_kb.swapCmdOption, L"KbSwapCmdOption" },
+    { &g_kb.mediaFirst, L"KbMediaFirst" }, { &g_kb.extraKeys, L"KbExtraKeys" },
+};
 
 // Registry names for the on/off settings, in the order the window lists them. A row with an
 // invert option shows a checkbox for it while the switch is on.
@@ -228,6 +259,7 @@ static void LoadSettings() {
     g_set.twoTapMs = (int)max((DWORD)kTwoTapFastestMs, min(StoreGet(L"TwoTapMs", kTwoTapFastestMs), (DWORD)kTwoTapSlowestMs));
     g_themeMode = (int)min(StoreGet(L"Theme", THEME_AUTO), (DWORD)THEME_DARK);
     g_onTop = StoreGet(L"AlwaysOnTop", 0) != 0;
+    for (const auto& k : kKeyboardSettings) *k.value = StoreGet(k.reg, *k.value) != 0;
 }
 
 static void SaveSettings() {
@@ -245,6 +277,7 @@ static void SaveSettings() {
     put(L"TwoTapMs", (DWORD)g_set.twoTapMs);
     put(L"Theme", (DWORD)g_themeMode);
     put(L"AlwaysOnTop", g_onTop);
+    for (const auto& k : kKeyboardSettings) put(k.reg, *k.value);
 }
 
 static std::wstring ExePath() {
@@ -867,6 +900,154 @@ static void ShowStatus(HWND hwnd) {
         s.TouchActive ? L"on" : L"off", s.EnableAttempts, (unsigned long)s.LastEnableStatus,
         s.FramesTotal, s.FramesDropped, s.ReadErrors, s.OtherReports, s.LastOtherId, s.Injected);
     MessageBoxW(hwnd, text, L"MagicMouseNative status", MB_ICONINFORMATION);
+}
+
+// ---------------------------------------------------------------------------------------
+// Apple keyboard (keyboard.h): a low-level keyboard hook remaps keys while an Apple keyboard
+// is connected; a status thread notices it come and go and reads its battery.
+
+static const ULONG_PTR kKbInjected = 0x4D4D4E4B;  // dwExtraInfo on keys we send ("MMNK")
+static std::atomic<int> g_kbPid{0};                // the connected Apple keyboard's product ID, 0 none
+static std::atomic<int> g_kbBattery{-1};
+static HHOOK g_kbHook;
+static DWORD g_kbThreadId;
+static KbRemapper g_kbRemap;                       // keyboard hook thread only
+
+// Keys whose virtual key MapVirtualKey maps to a non-extended scan code (the numpad's), so
+// they'd arrive as numpad keys without the extended flag.
+static bool KbExtended(BYTE vk) {
+    switch (vk) {
+    case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT: case VK_INSERT: case VK_DELETE:
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_LWIN: case VK_RWIN:
+    case VK_RMENU: case VK_RCONTROL: case VK_SNAPSHOT:
+        return true;
+    }
+    return false;
+}
+
+static void SendKeys(const KbEvent* e, int n) {
+    INPUT in[16] = {};
+    n = min(n, (int)ARRAYSIZE(in));
+    for (int i = 0; i < n; i++) {
+        UINT sc = MapVirtualKeyW(e[i].vk, MAPVK_VK_TO_VSC_EX);
+        in[i].type = INPUT_KEYBOARD;
+        in[i].ki.wVk = e[i].vk;
+        in[i].ki.wScan = (WORD)(e[i].vk == VK_PAUSE ? 0x45 : sc & 0xFF);
+        in[i].ki.dwFlags = (e[i].up ? KEYEVENTF_KEYUP : 0) |
+                           ((sc >> 8) == 0xE0 || KbExtended(e[i].vk) ? KEYEVENTF_EXTENDEDKEY : 0);
+        in[i].ki.dwExtraInfo = kKbInjected;
+    }
+    if (n) SendInput(n, in, sizeof(INPUT));
+}
+
+// Only our own keys are skipped (like MacKeys): the layout's made-up AltGr Left Control has
+// to be seen to be dropped.
+static LRESULT CALLBACK KeyboardHook(int code, WPARAM wp, LPARAM lp) {
+    const KBDLLHOOKSTRUCT* k = (const KBDLLHOOKSTRUCT*)lp;
+    if (code == HC_ACTION && k->dwExtraInfo != kKbInjected && k->vkCode < 256 && g_kbPid && g_kb.enabled) {
+        bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
+        KbResult r = g_kbRemap.Process(g_kb.Snapshot(), (uint8_t)k->vkCode, k->scanCode, down);
+        SendKeys(r.events, r.count);
+        if (r.toggleTopRow) PostMessageW(g_tray, WM_KBTOGGLE, 0, 0);
+        if (r.swallow) return 1;
+    }
+    return CallNextHookEx(g_kbHook, code, wp, lp);
+}
+
+static void ReleaseHeldKeys() {
+    KbEvent e[16];
+    SendKeys(e, g_kbRemap.ReleaseAll(e, ARRAYSIZE(e)));
+}
+
+// Own thread, like the mouse hook: every key in the system waits for it. WM_KBRELEASE (from
+// a settings change or the keyboard going away) lets go of keys a remapped press holds.
+static DWORD WINAPI KeyboardThread(LPVOID) {
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook, GetModuleHandleW(nullptr), 0);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KBRELEASE) ReleaseHeldKeys();
+        DispatchMessageW(&msg);
+    }
+    UnhookWindowsHookEx(g_kbHook);
+    ReleaseHeldKeys();
+    return 0;
+}
+
+// The connected Apple keyboard's product ID (0 if none), from the keyboards Windows reads.
+static int FindAppleKeyboard() {
+    UINT n = 0;
+    if (GetRawInputDeviceList(nullptr, &n, sizeof(RAWINPUTDEVICELIST)) != 0 || !n) return 0;
+    std::vector<RAWINPUTDEVICELIST> list(n);
+    n = GetRawInputDeviceList(list.data(), &n, sizeof(RAWINPUTDEVICELIST));
+    if (n == (UINT)-1) return 0;
+    for (UINT i = 0; i < n; i++) {
+        if (list[i].dwType != RIM_TYPEKEYBOARD) continue;
+        wchar_t name[512];
+        UINT len = ARRAYSIZE(name);
+        if (GetRawInputDeviceInfoW(list[i].hDevice, RIDI_DEVICENAME, name, &len) == (UINT)-1) continue;
+        uint32_t vid, pid;
+        if (ParseVidPid(name, &vid, &pid) && IsAppleKeyboard(vid, pid)) return (int)pid;
+    }
+    return 0;
+}
+
+// Battery: input report 0x90 (status, %) of Apple's vendor collection (usage page FF00,
+// usage 0x14), on USB and Bluetooth alike. Asking an asleep keyboard can take seconds.
+static int ReadKeyboardBattery() {
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO devs = SetupDiGetClassDevsW(&hidGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (devs == INVALID_HANDLE_VALUE) return -1;
+
+    int level = -1;
+    SP_DEVICE_INTERFACE_DATA ifd{ sizeof(ifd) };
+    for (DWORD i = 0; level < 0 && SetupDiEnumDeviceInterfaces(devs, nullptr, &hidGuid, i, &ifd); i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(devs, &ifd, nullptr, 0, &need, nullptr);
+        std::vector<BYTE> raw(need);
+        auto det = (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)raw.data();
+        det->cbSize = sizeof(*det);
+        if (!SetupDiGetDeviceInterfaceDetailW(devs, &ifd, det, need, nullptr, nullptr)) continue;
+        uint32_t vid, pid;
+        if (!ParseVidPid(det->DevicePath, &vid, &pid) || !IsAppleKeyboard(vid, pid)) continue;
+
+        HANDLE h = CreateFileW(det->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        PHIDP_PREPARSED_DATA pp = nullptr;
+        HIDP_CAPS caps{};
+        if (HidD_GetPreparsedData(h, &pp)) {
+            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS && caps.UsagePage == 0xFF00 && caps.Usage == 0x14 &&
+                caps.InputReportByteLength >= 3) {
+                std::vector<BYTE> in(caps.InputReportByteLength);
+                in[0] = 0x90;
+                if (HidD_GetInputReport(h, in.data(), (ULONG)in.size()) && in[0] == 0x90 && in[2] <= 100) level = in[2];
+            }
+            HidD_FreePreparsedData(pp);
+        }
+        CloseHandle(h);
+    }
+    SetupDiDestroyDeviceInfoList(devs);
+    return level;
+}
+
+static DWORD WINAPI KeyboardStatusThread(LPVOID) {
+    ULONGLONG lastBattery = 0;
+    do {
+        int pid = FindAppleKeyboard();
+        int old = g_kbPid.exchange(pid);
+        bool changed = pid != old;
+        if (old && !pid) PostThreadMessageW(g_kbThreadId, WM_KBRELEASE, 0, 0);
+        int level = pid ? g_kbBattery.load() : -1;
+        ULONGLONG now = GetTickCount64();
+        if (pid && (changed || now - lastBattery >= (level >= 0 ? kBatteryPollMs : kBatteryRetryMs))) {
+            lastBattery = now;
+            int got = ReadKeyboardBattery();
+            if (got >= 0 || changed) level = got;       // asleep: keep the last reading
+        }
+        if (level != g_kbBattery.exchange(level)) changed = true;
+        if (changed) PostMessageW(g_tray, WM_KBSTATE, 0, 0);
+    } while (WaitForSingleObject(g_stop, kStatusPollMs) == WAIT_TIMEOUT);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2219,7 +2400,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 }
 
-enum TrayMenuId { ID_MENU_OPEN = 400, ID_MENU_ENABLED, ID_MENU_EXIT };
+enum TrayMenuId { ID_MENU_OPEN = 400, ID_MENU_ENABLED, ID_MENU_EXIT, ID_MENU_KB_FIRST };    // + kKeyboardSettings index
 
 // ---------------------------------------------------------------------------------------
 // Tray icon
@@ -2260,12 +2441,14 @@ static void UpdateTray(HWND hwnd, DWORD action) {
     nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = g_trayIcon;
-    wchar_t battery[32] = L"";
+    wchar_t battery[32] = L"", keyboard[48] = L"";
     if (g_battery >= 0) swprintf_s(battery, L", battery %d%%", g_battery.load());
+    if (g_kbPid && g_kbBattery >= 0) swprintf_s(keyboard, L"\nApple keyboard, battery %d%%", g_kbBattery.load());
+    else if (g_kbPid) wcscpy_s(keyboard, L"\nApple keyboard connected");
     int state = g_mouseState;
-    swprintf_s(nid.szTip, L"%s - %s%s", g_deviceName.c_str(),
+    swprintf_s(nid.szTip, L"%.60s - %s%s%s", g_deviceName.c_str(),
                state == MOUSE_SEARCHING ? L"searching" : state == MOUSE_ASLEEP ? L"asleep" : g_set.enabled ? L"on" : L"paused",
-               battery);
+               battery, keyboard);
     Shell_NotifyIconW(action, &nid);
 }
 
@@ -2290,10 +2473,63 @@ static void OnBatteryChanged(HWND tray) {
     warned = level >= 0 && level <= kBatteryLow;
 }
 
+// A tray balloon without sound (the keyboard's notices).
+static void TrayNotice(HWND tray, DWORD icon, const wchar_t* title, const wchar_t* text) {
+    NOTIFYICONDATAW nid{ sizeof(nid) };
+    nid.hWnd = tray;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = icon | NIIF_NOSOUND;
+    wcscpy_s(nid.szInfoTitle, title);
+    wcscpy_s(nid.szInfo, text);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+static void OnKeyboardChanged(HWND tray) {
+    static bool warned;
+    int level = g_kbBattery;
+    UpdateTray(tray, NIM_MODIFY);
+    if (level >= 0 && level <= kBatteryLow && !warned) {
+        wchar_t text[96];
+        swprintf_s(text, L"%d%% left - recharge the keyboard soon.", level);
+        TrayNotice(tray, NIIF_WARNING, L"Apple keyboard battery low", text);
+    }
+    warned = level >= 0 && level <= kBatteryLow;
+}
+
+// Settings changed: let go of anything a remapped key is holding under the old ones.
+static void OnKeyboardSettingChanged(HWND tray) {
+    SaveSettings();
+    PostThreadMessageW(g_kbThreadId, WM_KBRELEASE, 0, 0);
+    UpdateTray(tray, NIM_MODIFY);
+}
+
+static HMENU KeyboardMenu() {
+    static const wchar_t* const labels[] = {
+        L"Remap keys", L"Right Option is Fn (arrows: Home, End, Page Up / Down)", L"Swap Command and Option",
+        L"Media keys on the top row (Fn+Esc switches)", L"F13-F15: Print Screen, Scroll Lock, Pause",
+    };
+    static_assert(ARRAYSIZE(labels) == ARRAYSIZE(kKeyboardSettings), "a label per keyboard setting");
+    HMENU m = CreatePopupMenu();
+    int pid = g_kbPid, level = g_kbBattery;
+    wchar_t head[96];
+    if (!pid) wcscpy_s(head, L"No Apple keyboard connected");
+    else if (level >= 0) swprintf_s(head, L"%s - %d%%", AppleKeyboardName(pid), level);
+    else wcscpy_s(head, AppleKeyboardName(pid));
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, head);
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    for (int i = 0; i < (int)ARRAYSIZE(kKeyboardSettings); i++) {
+        UINT flags = MF_STRING | (*kKeyboardSettings[i].value ? MF_CHECKED : 0) | (i && !g_kb.enabled ? MF_GRAYED : 0);
+        AppendMenuW(m, flags, ID_MENU_KB_FIRST + i, labels[i]);
+    }
+    return m;
+}
+
 static void ShowTrayMenu(HWND hwnd) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | MF_DEFAULT, ID_MENU_OPEN, L"Open MagicMouseNative");
     AppendMenuW(m, MF_STRING | (g_set.enabled ? MF_CHECKED : 0), ID_MENU_ENABLED, L"Enabled");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)KeyboardMenu(), L"Apple keyboard");     // destroyed with m
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_MENU_EXIT, L"Exit");
     POINT pt;
@@ -2345,7 +2581,22 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_BATTERY:
         OnBatteryChanged(hwnd);
         return 0;
+    case WM_KBSTATE:
+        OnKeyboardChanged(hwnd);
+        return 0;
+    case WM_KBTOGGLE:                      // Fn + Esc
+        g_kb.mediaFirst = !g_kb.mediaFirst;
+        OnKeyboardSettingChanged(hwnd);
+        TrayNotice(hwnd, NIIF_INFO, L"Apple keyboard top row",
+                   g_kb.mediaFirst ? L"Media keys (Fn for F1-F12)" : L"F1-F12 (Fn for media keys)");
+        return 0;
     case WM_COMMAND:
+        if (LOWORD(wp) >= ID_MENU_KB_FIRST && LOWORD(wp) < ID_MENU_KB_FIRST + ARRAYSIZE(kKeyboardSettings)) {
+            std::atomic<bool>* value = kKeyboardSettings[LOWORD(wp) - ID_MENU_KB_FIRST].value;
+            *value = !*value;
+            OnKeyboardSettingChanged(hwnd);
+            return 0;
+        }
         switch (LOWORD(wp)) {
         case ID_MENU_OPEN:    ShowWindowFront(); break;
         case ID_MENU_ENABLED:
@@ -2428,6 +2679,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     HANDLE engine = CreateThread(nullptr, 0, EngineThread, nullptr, 0, nullptr);
     SetThreadPriority(engine, THREAD_PRIORITY_ABOVE_NORMAL);
     HANDLE battery = CreateThread(nullptr, 0, StatusThread, nullptr, 0, nullptr);
+    HANDLE keyboard = CreateThread(nullptr, 0, KeyboardThread, nullptr, 0, &g_kbThreadId);
+    SetThreadPriority(keyboard, THREAD_PRIORITY_TIME_CRITICAL);
+    HANDLE keyboardStatus = CreateThread(nullptr, 0, KeyboardStatusThread, nullptr, 0, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -2436,14 +2690,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     }
 
     PostThreadMessageW(hookThreadId, WM_QUIT, 0, 0);
-    WaitForSingleObject(hook, 2000);
+    PostThreadMessageW(g_kbThreadId, WM_QUIT, 0, 0);       // also lets go of held keys
+    HANDLE hooks[2] = { hook, keyboard };
+    WaitForMultipleObjects(2, hooks, TRUE, 2000);
     CloseHandle(hook);
+    CloseHandle(keyboard);
     if (g_middleFor) SendMouse(MOUSEEVENTF_MIDDLEUP);
     SetEvent(g_stop);
-    HANDLE threads[2] = { engine, battery };
-    WaitForMultipleObjects(2, threads, TRUE, 5000);
+    HANDLE threads[3] = { engine, battery, keyboardStatus };
+    WaitForMultipleObjects(3, threads, TRUE, 5000);
     CloseHandle(engine);
     CloseHandle(battery);
+    CloseHandle(keyboardStatus);
     CloseHandle(g_stop);
     if (g_single) CloseHandle(g_single);
     if (g_taskbar) g_taskbar->Release();
