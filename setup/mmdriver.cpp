@@ -8,18 +8,21 @@
 //       mouse and, with /testsigning or when asked, turns on test signing (BitLocker is
 //       suspended for that one restart).
 //   mmdriver uninstall [/quiet]           removes the driver from the mouse, the driver store
-//                                         and the certificate stores
+//                                         and the certificate stores, and undoes Boot Camp mode
 //   mmdriver bootcamp [AppleWirelessMouse.inf]
 //       Boot Camp mode (no test signing; Secure Boot can stay on): puts Apple's signed
 //       applewirelessmouse driver on the mouse instead of mmfilter and turns on full
 //       Bluetooth packet logging, which the app reads touches from (running as administrator).
-//       Apple's driver isn't included: take AppleWirelessMouse.inf / .sys / .cat from Apple's
-//       Boot Camp drivers. "mmdriver install" switches back to mmfilter.
+//       Apple's driver isn't included: without a path it uses AppleWirelessMouse.inf next to
+//       this exe, or a copy already in Windows' driver store; otherwise take the .inf / .sys /
+//       .cat from Apple's Boot Camp drivers. What it changes is noted in
+//       HKLM\SOFTWARE\MagicMouseNative\BootCamp, so "uninstall" undoes exactly that (Apple's
+//       driver is removed only if this added it). "mmdriver install" switches back to mmfilter.
 //   /quiet: no questions and no "press Enter" at the end (for the installer).
-// install and uninstall ask for administrator rights (UAC) when not already elevated.
+// install, uninstall and bootcamp ask for administrator rights (UAC) when not already elevated.
 //
-// Exit codes: 0 done, 1 failed, 2 Secure Boot is on, 3 no Magic Mouse paired, 10 done but a
-// restart is needed.
+// Exit codes: 0 done, 1 failed, 2 Secure Boot is on, 3 no Magic Mouse paired, 4 Apple's driver
+// not found, 10 done but a restart is needed.
 //
 // Build: cl /nologo /EHsc /O2 /W4 /std:c++17 /DUNICODE /D_UNICODE mmdriver.cpp
 //        /link setupapi.lib newdev.lib crypt32.lib advapi32.lib shell32.lib
@@ -52,7 +55,7 @@ static const wchar_t* const kHardwareIds[] = {
 // The mice Apple's Boot Camp driver (applewirelessmouse.inf) lists: not the USB-C mouse.
 static const wchar_t* const kBootCampIds[] = { kHardwareIds[0], kHardwareIds[1], kHardwareIds[2] };
 static const wchar_t kBthPortParams[] = L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters";
-enum { EXIT_DONE = 0, EXIT_FAILED = 1, EXIT_SECURE_BOOT = 2, EXIT_NO_MOUSE = 3, EXIT_RESTART = 10 };
+enum { EXIT_DONE = 0, EXIT_FAILED = 1, EXIT_SECURE_BOOT = 2, EXIT_NO_MOUSE = 3, EXIT_NO_DRIVER = 4, EXIT_RESTART = 10 };
 
 static bool g_quiet;
 
@@ -182,8 +185,9 @@ static void UntrustCertificate() {
     }
 }
 
-// The driver store's copies of mmfilter.inf (%windir%\INF\oemNN.inf), found by catalog name.
-template <class F> static void ForEachInstalledInf(F f) {
+// The driver store's copies of an INF (%windir%\INF\oemNN.inf), found by catalog name:
+// mmfilter.inf by default.
+template <class F> static void ForEachInstalledInf(F f, const wchar_t* catalog = kCatalog) {
     wchar_t dir[MAX_PATH];
     GetWindowsDirectoryW(dir, MAX_PATH);
     std::wstring inf = std::wstring(dir) + L"\\INF\\";
@@ -194,7 +198,7 @@ template <class F> static void ForEachInstalledInf(F f) {
         std::wstring path = inf + fd.cFileName;
         wchar_t cat[MAX_PATH] = L"";
         GetPrivateProfileStringW(L"Version", L"CatalogFile", L"", cat, MAX_PATH, path.c_str());
-        if (_wcsicmp(cat, kCatalog) == 0) f(path);
+        if (_wcsicmp(cat, catalog) == 0) f(path);
     } while (FindNextFileW(find, &fd));
     FindClose(find);
 }
@@ -206,6 +210,8 @@ static bool Ask(const wchar_t* question) {
     if (!fgetws(line, ARRAYSIZE(line), stdin)) return false;
     return line[0] == L'y' || line[0] == L'Y';
 }
+
+static std::wstring StoredAppleInf();
 
 static int Status() {
     bool secure = SecureBootOn(), test = TestSigningOn();
@@ -219,28 +225,72 @@ static int Status() {
     RegGetValueW(HKEY_LOCAL_MACHINE, kBthPortParams, L"EtwLogSensitiveData", RRF_RT_REG_DWORD, nullptr, &logging, &size);
     wprintf(L"Boot Camp mode: Apple's driver %s, full Bluetooth logging %s\n",
             BootCampDriverRunning() ? L"running" : L"not running", logging ? L"on" : L"off");
+    std::wstring stored = StoredAppleInf();
+    wprintf(L"Apple's driver in Windows' driver store: %s\n", stored.empty() ? L"no" : stored.c_str());
     return EXIT_DONE;
 }
 
+// What "mmdriver bootcamp" changed, so uninstalling undoes just that.
+static const wchar_t kUndoKey[] = L"SOFTWARE\\MagicMouseNative\\BootCamp";
+static const DWORD kAbsent = 0xFFFFFFFF;        // the value didn't exist before
+
+static DWORD GetDword(const wchar_t* key, const wchar_t* name, DWORD def) {
+    DWORD v = def, size = sizeof(v);
+    return RegGetValueW(HKEY_LOCAL_MACHINE, key, name, RRF_RT_REG_DWORD, nullptr, &v, &size) == ERROR_SUCCESS ? v : def;
+}
+
+static void PutDword(const wchar_t* key, const wchar_t* name, DWORD v) {
+    RegSetKeyValueW(HKEY_LOCAL_MACHINE, key, name, REG_DWORD, &v, sizeof(v));
+}
+
+// Sets a BTHPORT value, first noting its old one (once: a second run keeps the first).
 static bool SetBthPortValue(const wchar_t* name, DWORD value, bool* changed) {
-    DWORD old = ~value, size = sizeof(old);
-    RegGetValueW(HKEY_LOCAL_MACHINE, kBthPortParams, name, RRF_RT_REG_DWORD, nullptr, &old, &size);
+    DWORD old = GetDword(kBthPortParams, name, kAbsent);
+    std::wstring prev = std::wstring(L"Prev") + name;
+    if (GetDword(kUndoKey, prev.c_str(), 0xFFFFFFFE) == 0xFFFFFFFE) PutDword(kUndoKey, prev.c_str(), old);
     if (old == value) return true;
     *changed = true;
     return RegSetKeyValueW(HKEY_LOCAL_MACHINE, kBthPortParams, name, REG_DWORD, &value, sizeof(value)) == ERROR_SUCCESS;
 }
 
+static void RestoreBthPortValue(const wchar_t* name, bool* changed) {
+    std::wstring prev = std::wstring(L"Prev") + name;
+    DWORD old = GetDword(kUndoKey, prev.c_str(), 0xFFFFFFFE);
+    if (old == 0xFFFFFFFE) return;                  // never changed by us
+    if (GetDword(kBthPortParams, name, kAbsent) != old) *changed = true;
+    if (old == kAbsent) RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kBthPortParams, name);
+    else PutDword(kBthPortParams, name, old);
+}
+
+// Apple's driver already in Windows' driver store (from Boot Camp, or an earlier install):
+// its INF in the store's own folder, which has the .sys and .cat next to it.
+static const wchar_t kAppleCatalog[] = L"applewirelessmouse.cat";
+
+static std::wstring StoredAppleInf() {
+    std::wstring found;
+    ForEachInstalledInf([&](const std::wstring& oem) {
+        wchar_t loc[MAX_PATH];
+        if (found.empty() && SetupGetInfDriverStoreLocationW(oem.c_str(), nullptr, nullptr, loc, MAX_PATH, nullptr))
+            found = loc;
+    }, kAppleCatalog);
+    return found;
+}
+
 static int BootCamp(const std::wstring& infArg) {
     wchar_t full[MAX_PATH] = L"";
-    std::wstring inf = infArg.empty() ? HereDir() + L"AppleWirelessMouse.inf"
-                     : GetFullPathNameW(infArg.c_str(), MAX_PATH, full, nullptr) ? full : infArg;
-    if (GetFileAttributesW(inf.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        wprintf(L"Apple's driver wasn't found (%s).\n\n"
+    std::wstring inf = !infArg.empty() ? (GetFullPathNameW(infArg.c_str(), MAX_PATH, full, nullptr) ? full : infArg)
+                                       : HereDir() + L"AppleWirelessMouse.inf";
+    if (infArg.empty() && GetFileAttributesW(inf.c_str()) == INVALID_FILE_ATTRIBUTES) inf = StoredAppleInf();
+    if (inf.empty() || GetFileAttributesW(inf.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        wprintf(L"Apple's driver wasn't found%s%s%s.\n\n"
                 L"It isn't included: take AppleWirelessMouse.inf, .sys and .cat from Apple's Boot Camp\n"
                 L"drivers (the AppleWirelessMouse64 package) and run: mmdriver bootcamp <path to the .inf>\n",
-                inf.c_str());
-        return EXIT_FAILED;
+                inf.empty() ? L"" : L" (", inf.c_str(), inf.empty() ? L"" : L")");
+        return EXIT_NO_DRIVER;
     }
+    // Uninstalling removes Apple's driver only if this added it.
+    if (GetDword(kUndoKey, L"AddedAppleDriver", kAbsent) == kAbsent)
+        PutDword(kUndoKey, L"AddedAppleDriver", StoredAppleInf().empty() ? 1 : 0);
     StopApp();      // it keeps mmfilter's control device open, which would keep mmfilter loaded
     bool found = false, done = false, restart = false;
     for (const wchar_t* id : kBootCampIds) {
@@ -352,6 +402,33 @@ static int Uninstall() {
     return restart ? EXIT_RESTART : EXIT_DONE;
 }
 
+// Undoes "mmdriver bootcamp": Apple's driver comes off (if that added it) and Bluetooth
+// logging goes back to how it was.
+static int UndoBootCamp() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kUndoKey, 0, KEY_READ, &k) != ERROR_SUCCESS) return EXIT_DONE;   // never used
+    RegCloseKey(k);
+    bool restart = false, failed = false, logging = false;
+    if (GetDword(kUndoKey, L"AddedAppleDriver", 0) == 1) {
+        ForEachInstalledInf([&](const std::wstring& path) {
+            BOOL reboot = FALSE;
+            if (DiUninstallDriverW(nullptr, path.c_str(), 0, &reboot)) {
+                restart = restart || reboot;
+            } else {
+                failed = true;
+                wprintf(L"Removing Apple's driver (%s) failed (error %lu).\n", path.c_str(), GetLastError());
+            }
+        }, kAppleCatalog);
+        if (!failed) wprintf(L"Apple's Boot Camp driver is removed.\n");
+    }
+    RestoreBthPortValue(L"EtwLogSensitiveData", &logging);
+    RestoreBthPortValue(L"EtwDropLargeEvents", &logging);
+    if (logging) wprintf(L"Bluetooth logging is back to how it was (after a restart).\n");
+    if (!failed) RegDeleteTreeW(HKEY_LOCAL_MACHINE, kUndoKey);
+    if (failed) return EXIT_FAILED;
+    return restart || logging ? EXIT_RESTART : EXIT_DONE;
+}
+
 // Runs this exe again as administrator (a UAC prompt) with the same arguments, and waits.
 static int RunElevated(int argc, wchar_t** argv) {
     wchar_t self[MAX_PATH];
@@ -391,8 +468,11 @@ int wmain(int argc, wchar_t** argv) {
     int code;
     if (cmd == L"status") {
         code = Status();
-    } else if (cmd == L"install" || cmd == L"uninstall") {
-        code = cmd == L"install" ? Install(testSigning) : Uninstall();
+    } else if (cmd == L"install") {
+        code = Install(testSigning);
+    } else if (cmd == L"uninstall") {               // both drivers, and Boot Camp mode's settings
+        int a = Uninstall(), b = UndoBootCamp();
+        code = a == EXIT_FAILED || b == EXIT_FAILED ? EXIT_FAILED : a == EXIT_RESTART || b == EXIT_RESTART ? EXIT_RESTART : EXIT_DONE;
     } else if (cmd == L"bootcamp") {
         code = BootCamp(path);
     } else {

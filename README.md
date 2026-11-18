@@ -107,13 +107,21 @@ Secure Boot can stay on. Apple's driver switches the mouse into multi-touch mode
 reads the touches from Windows' Bluetooth packet log (ETW). It works for the 2009 mouse and the
 Magic Mouse 2 (Apple's driver doesn't list the USB-C mouse). Not yet tested end to end.
 
-1. Get `AppleWirelessMouse.inf`, `.sys` and `.cat` from Apple's Boot Camp drivers (the
-   AppleWirelessMouse64 package). They aren't included here.
-2. Run `mmdriver bootcamp <path to AppleWirelessMouse.inf>`. It puts Apple's driver on the mouse
-   and turns on full Bluetooth logging (`BTHPORT\Parameters\EtwLogSensitiveData`). Turn
-   Bluetooth off and on afterwards.
-3. Run the app **as administrator** (starting the Bluetooth trace needs it). It notices Apple's
-   driver and says "Connected (Boot Camp driver)".
+1. Apple's driver isn't included. If it's already on the PC (from Boot Camp, or installed
+   before), it's used. Otherwise get `AppleWirelessMouse.inf`, `.sys` and `.cat` from Apple's
+   Boot Camp drivers (the AppleWirelessMouse64 package).
+2. In the **installer**, choose "Boot Camp mode" (and point it to `AppleWirelessMouse.inf` if
+   it asks). In the **portable** version, run `Install Boot Camp mode.cmd` (drag the `.inf`
+   onto it if needed). Either way it's `mmdriver bootcamp [AppleWirelessMouse.inf]`: Apple's
+   driver goes on the mouse and full Bluetooth logging is turned on
+   (`BTHPORT\Parameters\EtwLogSensitiveData`). Restart Windows afterwards.
+3. The app runs **as administrator** (starting the Bluetooth trace needs it); the installer
+   sets "Start with Windows" up that way. It says "Connected (Boot Camp driver)".
+
+Full Bluetooth logging covers every Bluetooth device: while an administrator program records
+the log, it can see what Bluetooth devices send, keyboards included. The app keeps only the
+mouse's touches, in memory. Uninstalling (or `Remove driver.cmd`) puts the setting back and
+removes Apple's driver if setup added it.
 
 Apple's driver also scrolls by itself; the app drops that scrolling while a finger is on the
 mouse and does its own. `mmdriver install` switches back to mmfilter. Differences from mmfilter:

@@ -3,7 +3,7 @@ rem Builds dist\: the installer and the portable zip. Build the driver (..\drive
 rem the app (..\app\build.bat) and mmdriver (build.bat) first. Needs Inno Setup's ISCC.
 setlocal
 cd /d "%~dp0"
-set VERSION=1.0.0
+set VERSION=1.1.0
 for %%f in (..\app\MagicMouseNative.exe ..\driver\out\mmfilter.sys ..\driver\out\mmfilter.cat mmdriver.exe) do (
     if not exist %%f (echo %%f is missing - build it first. & exit /b 1)
 )

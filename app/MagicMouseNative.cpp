@@ -2941,6 +2941,13 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
+    // Setup (elevated) registers "Start with Windows" as the administrator logon task, which
+    // Boot Camp mode needs; exit code 0 if it worked.
+    if (wcsstr(cmdLine, L"/registerstartup")) {
+        g_elevated = ProcessElevated(GetCurrentProcess());
+        return g_elevated && SetStartsWithWindows(true) ? 0 : 1;
+    }
+
     // Already running (an elevated copy's mutex is "access denied" to us): show its window.
     g_single = CreateMutexW(nullptr, TRUE, L"Local\\MagicMouseNative.Tray");
     if (GetLastError() == ERROR_ALREADY_EXISTS || GetLastError() == ERROR_ACCESS_DENIED) {
