@@ -74,7 +74,8 @@ on a real keyboard)
 - An Apple keyboard is optional; its remapping needs no driver.
 - 64-bit Windows 10 or 11.
 - Remove other Magic Mouse drivers first (Magic Utilities, Apple Boot Camp's
-  `applewirelessmouse`), because they sit on the same device.
+  `applewirelessmouse`), because they sit on the same device. Apple's driver can instead be
+  used on purpose, without test signing: see [Boot Camp mode](#boot-camp-mode-no-test-signing).
 - **Test signing.** The driver is test-signed, not Microsoft-signed, so Windows only loads it with
   test signing on. That needs Secure Boot turned off in the UEFI setup, then
   `bcdedit /set testsigning on` and a reboot. If BitLocker is on, have your recovery key ready
@@ -97,6 +98,27 @@ the mouse first, and make sure Secure Boot is off.
 Both trust the driver's test certificate ("MagicMouseNative Test") in the machine's
 certificate stores. That's how Windows accepts a test-signed driver package. Uninstalling
 removes the certificate again.
+
+### Boot Camp mode (no test signing)
+
+After [OpenMagicMouse](https://github.com/haikieudng-cyber/OpenMagicMouse): instead of
+mmfilter, Apple's own signed Boot Camp driver (`applewirelessmouse`) goes on the mouse, so
+Secure Boot can stay on. Apple's driver switches the mouse into multi-touch mode, and the app
+reads the touches from Windows' Bluetooth packet log (ETW). It works for the 2009 mouse and the
+Magic Mouse 2 (Apple's driver doesn't list the USB-C mouse). Not yet tested end to end.
+
+1. Get `AppleWirelessMouse.inf`, `.sys` and `.cat` from Apple's Boot Camp drivers (the
+   AppleWirelessMouse64 package). They aren't included here.
+2. Run `mmdriver bootcamp <path to AppleWirelessMouse.inf>`. It puts Apple's driver on the mouse
+   and turns on full Bluetooth logging (`BTHPORT\Parameters\EtwLogSensitiveData`). Turn
+   Bluetooth off and on afterwards.
+3. Run the app **as administrator** (starting the Bluetooth trace needs it). It notices Apple's
+   driver and says "Connected (Boot Camp driver)".
+
+Apple's driver also scrolls by itself; the app drops that scrolling while a finger is on the
+mouse and does its own. `mmdriver install` switches back to mmfilter. Differences from mmfilter:
+taps go through `SendInput` (so administrator windows need the app elevated, which this mode
+needs anyway), and "Re-enable multi-touch" can't resend the command.
 
 **Don't turn test signing off while the driver is installed.** Windows checks the signature
 every time it loads the driver, so it would block it and the mouse would stop working until
@@ -160,6 +182,10 @@ Magic Mouse ──Bluetooth──> BthEnum ──> mmfilter.sys ──> HidBth �
 - `tools/mmcapture`: logs touch frames to a text file. Close the app first.
 - `tools/mmreplay`: runs a capture through the gesture engine and prints the scrolling, clicks
   and how quickly each stroke started scrolling. Use it to tune gestures without the mouse.
+- `tools/btcapture`: reads Boot Camp mode's touch source (Windows' Bluetooth packet log) for a
+  few seconds and reports what it decoded. Run it as administrator while touching the mouse.
+- `tools/hcitest`: checks the Bluetooth packet decoding ([app/hciraw.h](app/hciraw.h)) with
+  hand-built packets.
 - `tools/kbtest`: checks the Apple keyboard remapping ([app/keyboard.h](app/keyboard.h))
   without a keyboard, and lists the keyboards on the PC.
 

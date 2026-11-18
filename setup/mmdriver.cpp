@@ -9,6 +9,12 @@
 //       suspended for that one restart).
 //   mmdriver uninstall [/quiet]           removes the driver from the mouse, the driver store
 //                                         and the certificate stores
+//   mmdriver bootcamp [AppleWirelessMouse.inf]
+//       Boot Camp mode (no test signing; Secure Boot can stay on): puts Apple's signed
+//       applewirelessmouse driver on the mouse instead of mmfilter and turns on full
+//       Bluetooth packet logging, which the app reads touches from (running as administrator).
+//       Apple's driver isn't included: take AppleWirelessMouse.inf / .sys / .cat from Apple's
+//       Boot Camp drivers. "mmdriver install" switches back to mmfilter.
 //   /quiet: no questions and no "press Enter" at the end (for the installer).
 // install and uninstall ask for administrator rights (UAC) when not already elevated.
 //
@@ -43,6 +49,9 @@ static const wchar_t* const kHardwareIds[] = {
     L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0269",   // Magic Mouse 2
     L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0323",   // Magic Mouse USB-C
 };
+// The mice Apple's Boot Camp driver (applewirelessmouse.inf) lists: not the USB-C mouse.
+static const wchar_t* const kBootCampIds[] = { kHardwareIds[0], kHardwareIds[1], kHardwareIds[2] };
+static const wchar_t kBthPortParams[] = L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters";
 enum { EXIT_DONE = 0, EXIT_FAILED = 1, EXIT_SECURE_BOOT = 2, EXIT_NO_MOUSE = 3, EXIT_RESTART = 10 };
 
 static bool g_quiet;
@@ -85,6 +94,17 @@ static bool DriverRunning() {
     if (h == INVALID_HANDLE_VALUE) return false;
     CloseHandle(h);
     return true;
+}
+
+static bool BootCampDriverRunning() {
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) return false;
+    SC_HANDLE svc = OpenServiceW(scm, L"applewirelessmouse", SERVICE_QUERY_STATUS);
+    SERVICE_STATUS st{};
+    bool running = svc && QueryServiceStatus(svc, &st) && st.dwCurrentState == SERVICE_RUNNING;
+    if (svc) CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return running;
 }
 
 static DWORD Run(const std::wstring& cmdLine) {
@@ -195,7 +215,62 @@ static int Status() {
     wprintf(L"Test signing:   %s\n", test ? L"on" : L"off");
     wprintf(L"Driver package: %s\n", installed ? L"installed" : L"not installed");
     wprintf(L"Driver running: %s\n", DriverRunning() ? L"yes" : L"no (is the mouse connected?)");
+    DWORD logging = 0, size = sizeof(logging);
+    RegGetValueW(HKEY_LOCAL_MACHINE, kBthPortParams, L"EtwLogSensitiveData", RRF_RT_REG_DWORD, nullptr, &logging, &size);
+    wprintf(L"Boot Camp mode: Apple's driver %s, full Bluetooth logging %s\n",
+            BootCampDriverRunning() ? L"running" : L"not running", logging ? L"on" : L"off");
     return EXIT_DONE;
+}
+
+static bool SetBthPortValue(const wchar_t* name, DWORD value, bool* changed) {
+    DWORD old = ~value, size = sizeof(old);
+    RegGetValueW(HKEY_LOCAL_MACHINE, kBthPortParams, name, RRF_RT_REG_DWORD, nullptr, &old, &size);
+    if (old == value) return true;
+    *changed = true;
+    return RegSetKeyValueW(HKEY_LOCAL_MACHINE, kBthPortParams, name, REG_DWORD, &value, sizeof(value)) == ERROR_SUCCESS;
+}
+
+static int BootCamp(const std::wstring& infArg) {
+    wchar_t full[MAX_PATH] = L"";
+    std::wstring inf = infArg.empty() ? HereDir() + L"AppleWirelessMouse.inf"
+                     : GetFullPathNameW(infArg.c_str(), MAX_PATH, full, nullptr) ? full : infArg;
+    if (GetFileAttributesW(inf.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        wprintf(L"Apple's driver wasn't found (%s).\n\n"
+                L"It isn't included: take AppleWirelessMouse.inf, .sys and .cat from Apple's Boot Camp\n"
+                L"drivers (the AppleWirelessMouse64 package) and run: mmdriver bootcamp <path to the .inf>\n",
+                inf.c_str());
+        return EXIT_FAILED;
+    }
+    StopApp();      // it keeps mmfilter's control device open, which would keep mmfilter loaded
+    bool found = false, done = false, restart = false;
+    for (const wchar_t* id : kBootCampIds) {
+        BOOL reboot = FALSE;
+        if (UpdateDriverForPlugAndPlayDevicesW(nullptr, id, inf.c_str(), INSTALLFLAG_FORCE, &reboot)) {
+            found = done = true;
+            restart = restart || reboot;
+        } else if (GetLastError() != ERROR_NO_SUCH_DEVINST) {
+            found = true;
+            wprintf(L"Installing Apple's driver on the mouse failed (error %lu).\n", GetLastError());
+        }
+    }
+    if (!found) {
+        wprintf(L"No Magic Mouse that Apple's driver supports (2009 or Magic Mouse 2) is paired.\n");
+        return EXIT_NO_MOUSE;
+    }
+    if (!done) return EXIT_FAILED;
+
+    // Windows blanks Bluetooth packets' contents in its log unless this is on.
+    bool changed = false;
+    if (!SetBthPortValue(L"EtwLogSensitiveData", 1, &changed) || !SetBthPortValue(L"EtwDropLargeEvents", 0, &changed)) {
+        wprintf(L"Couldn't turn full Bluetooth logging on (BTHPORT\\Parameters).\n");
+        return EXIT_FAILED;
+    }
+    wprintf(L"Apple's Boot Camp driver is on the Magic Mouse.\n");
+    if (changed) wprintf(L"Full Bluetooth logging is on: turn Bluetooth off and on (or restart) for it to apply.\n");
+    wprintf(L"Run MagicMouseNative as administrator (its \"Run as administrator\" button, or \"Start with\n"
+            L"Windows\" from an administrator copy) so it can read the touches.\n");
+    if (restart) wprintf(L"Restart Windows to finish.\n");
+    return restart ? EXIT_RESTART : EXIT_DONE;
 }
 
 static int Install(bool testSigning) {
@@ -282,7 +357,10 @@ static int RunElevated(int argc, wchar_t** argv) {
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     std::wstring args;
-    for (int i = 1; i < argc; i++) args += std::wstring(i > 1 ? L" " : L"") + argv[i];
+    for (int i = 1; i < argc; i++) {
+        bool quote = wcschr(argv[i], L' ') != nullptr;
+        args += std::wstring(i > 1 ? L" " : L"") + (quote ? L"\"" : L"") + argv[i] + (quote ? L"\"" : L"");
+    }
     SHELLEXECUTEINFOW sei{ sizeof(sei) };
     sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
     sei.lpVerb = L"runas";
@@ -303,18 +381,23 @@ static int RunElevated(int argc, wchar_t** argv) {
 int wmain(int argc, wchar_t** argv) {
     std::wstring cmd = argc > 1 ? argv[1] : L"";
     bool testSigning = false;
+    std::wstring path;
     for (int i = 2; i < argc; i++) {
         if (_wcsicmp(argv[i], L"/quiet") == 0) g_quiet = true;
-        if (_wcsicmp(argv[i], L"/testsigning") == 0) testSigning = true;
+        else if (_wcsicmp(argv[i], L"/testsigning") == 0) testSigning = true;
+        else path = argv[i];
     }
-    if ((cmd == L"install" || cmd == L"uninstall") && !IsElevated()) return RunElevated(argc, argv);
+    if ((cmd == L"install" || cmd == L"uninstall" || cmd == L"bootcamp") && !IsElevated()) return RunElevated(argc, argv);
     int code;
     if (cmd == L"status") {
         code = Status();
     } else if (cmd == L"install" || cmd == L"uninstall") {
         code = cmd == L"install" ? Install(testSigning) : Uninstall();
+    } else if (cmd == L"bootcamp") {
+        code = BootCamp(path);
     } else {
-        wprintf(L"Usage: mmdriver status | install [/testsigning] [/quiet] | uninstall [/quiet]\n");
+        wprintf(L"Usage: mmdriver status | install [/testsigning] [/quiet] | uninstall [/quiet]\n"
+                L"       mmdriver bootcamp [AppleWirelessMouse.inf] [/quiet]\n");
         code = EXIT_FAILED;
     }
     // Started in its own console window (e.g. elevated from a script): keep it readable.

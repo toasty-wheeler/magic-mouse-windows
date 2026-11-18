@@ -10,6 +10,10 @@
 // click, and the stock report has no middle button, so a low-level mouse hook swaps that
 // click for middle down / up while two fingers are on the surface.
 //
+// Boot Camp mode (hciraw.h, after OpenMagicMouse): with Apple's signed applewirelessmouse.sys
+// on the mouse instead of mmfilter, frames come from Windows' Bluetooth packet log instead
+// (needs administrator; works with Secure Boot on).
+//
 // Apple keyboards (keyboard.h, after MacKeys): while one is connected, a low-level keyboard
 // hook gives it a Fn layer on Right Option, swaps Command and Option, puts media keys on the
 // top row and F13-F15 to use; its battery shows in the tray. Settings: the tray menu.
@@ -34,11 +38,15 @@
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
+#include <evntrace.h>
+#include <evntcons.h>
+#include <timeapi.h>
 #include <atomic>
 #include <string>
 #include <vector>
 #include "engine.h"
 #include "keyboard.h"
+#include "hciraw.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -51,6 +59,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "bthprops.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' " \
                         "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -650,6 +659,202 @@ static HANDLE g_stop;
 
 static void SetConnected(bool on) { PostMessageW(g_tray, WM_CONNECTED, on, 0); }
 
+// ---------------------------------------------------------------------------------------
+// Boot Camp mode (hciraw.h, after OpenMagicMouse): with Apple's signed applewirelessmouse.sys
+// on the mouse instead of mmfilter (no test signing, Secure Boot can stay on), Apple's driver
+// turns multi-touch on and the touch reports are read from Windows' Bluetooth packet log
+// (ETW, Microsoft-Windows-BTH-BTHPORT event 402). Starting that trace needs administrator.
+// Apple's driver also scrolls on its own; the mouse hook drops its wheel while we scroll.
+
+static const wchar_t kEtwSession[] = L"MagicMouseNative Bluetooth";
+static const GUID kBthPortProvider = { 0x8a1f9517, 0x3a8c, 0x4a9e, { 0xa0, 0x18, 0x4f, 0x17, 0xa2, 0x00, 0xf2, 0x77 } };
+static const GUID kEtwSessionGuid  = { 0x5d1f6c2a, 0x8e44, 0x4b1d, { 0x9a, 0x61, 0x2f, 0x0c, 0x6b, 0x7e, 0x13, 0xa4 } };
+static const ULONG kEtwFrameQueue = 128;
+static const DWORD kEtwFlushActiveMs = 8, kEtwFlushIdleMs = 30;    // ETW hands events over when flushed
+static const ULONGLONG kAppleWheelHoldMs = 250;                    // drop Apple's wheel this long after a touch
+
+enum Source { SOURCE_NONE, SOURCE_DRIVER, SOURCE_BOOTCAMP };
+static std::atomic<int>  g_source{SOURCE_NONE};         // where touch frames come from
+static std::atomic<bool> g_bootCampDriver{false};       // applewirelessmouse is running
+static std::atomic<bool> g_etwRunning{false};           // our trace session is up
+static std::atomic<bool> g_etwAsleep{false};            // the mouse's Bluetooth link closed
+static std::atomic<ULONGLONG> g_etwFrameTick{0};        // last touch frame (GetTickCount64)
+static std::atomic<ULONG> g_etwEvents{0}, g_etwFrames{0}, g_etwScrubbed{0};
+static HANDLE  g_etwReady;                              // set when frames are queued
+static SRWLOCK g_etwLock = SRWLOCK_INIT;                // guards the queue
+static MM_FRAME g_etwQueue[kEtwFrameQueue];
+static ULONG   g_etwHead, g_etwCount;
+static HciRawDecoder g_hci;                             // ProcessTrace's thread only
+static int     g_mouseLink = -1;                        // the link touch frames came on (same thread)
+
+static void EtwQueue(const uint8_t* r, uint32_t n, LONGLONG qpc) {
+    AcquireSRWLockExclusive(&g_etwLock);
+    ULONG slot = (g_etwHead + g_etwCount) % kEtwFrameQueue;
+    if (g_etwCount == kEtwFrameQueue) g_etwHead = (g_etwHead + 1) % kEtwFrameQueue;     // full: drop the oldest
+    else g_etwCount++;
+    MM_FRAME& f = g_etwQueue[slot];
+    f = MM_FRAME{};
+    f.Sequence = ++g_etwFrames;
+    f.Length = (USHORT)n;
+    f.Qpc = qpc;
+    memcpy(f.Report, r, n);
+    ReleaseSRWLockExclusive(&g_etwLock);
+}
+
+static ULONG EtwTake(MM_FRAME* out, ULONG max) {
+    ULONG n = 0;
+    AcquireSRWLockExclusive(&g_etwLock);
+    for (; n < max && g_etwCount; n++, g_etwCount--) {
+        out[n] = g_etwQueue[g_etwHead];
+        g_etwHead = (g_etwHead + 1) % kEtwFrameQueue;
+    }
+    ReleaseSRWLockExclusive(&g_etwLock);
+    return n;
+}
+
+// Every Bluetooth packet in the system passes here; only the mouse's touch frames are kept.
+static VOID WINAPI EtwEvent(PEVENT_RECORD e) {
+    if (e->EventHeader.EventDescriptor.Id != 402 || !e->UserData) return;
+    g_etwEvents++;
+    switch (g_hci.Feed((const uint8_t*)e->UserData, e->UserDataLength)) {
+    case HciRawDecoder::Scrubbed:
+        g_etwScrubbed++;
+        break;
+    case HciRawDecoder::Disconnected:
+        if (g_hci.Handle() == g_mouseLink) g_etwAsleep = true;
+        break;
+    case HciRawDecoder::Payload: {
+        uint8_t out[2][kMaxFrame];
+        uint32_t len[2];
+        int n = MouseFrames(g_hci.Data(), g_hci.Length(), out, len), queued = 0;
+        for (int i = 0; i < n; i++) {
+            if (out[i][0] == kMmLift) {
+                if (g_hci.Handle() != g_mouseLink) continue;    // another device's report 0x61
+            } else {
+                g_mouseLink = g_hci.Handle();
+                g_etwFrameTick = GetTickCount64();
+                g_etwAsleep = false;
+            }
+            EtwQueue(out[i], len[i], e->EventHeader.TimeStamp.QuadPart);
+            queued++;
+        }
+        if (queued) SetEvent(g_etwReady);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static std::vector<BYTE> EtwProperties() {
+    std::vector<BYTE> buf(sizeof(EVENT_TRACE_PROPERTIES) + sizeof(kEtwSession) + 16, 0);
+    auto p = (EVENT_TRACE_PROPERTIES*)buf.data();
+    p->Wnode.BufferSize = (ULONG)buf.size();
+    p->Wnode.Guid = kEtwSessionGuid;
+    p->Wnode.ClientContext = 1;             // QPC timestamps: the engine's clock
+    p->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    p->BufferSize = 16;                     // KB
+    p->MinimumBuffers = 4;
+    p->MaximumBuffers = 32;
+    p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
+    p->FlushTimer = 1;
+    p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    return buf;
+}
+
+static void EtwControl(TRACEHANDLE session, ULONG code) {
+    std::vector<BYTE> props = EtwProperties();
+    ControlTraceW(session, session ? nullptr : kEtwSession, (EVENT_TRACE_PROPERTIES*)props.data(), code);
+}
+
+static bool ServiceRunning(const wchar_t* name) {
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) return false;
+    SC_HANDLE svc = OpenServiceW(scm, name, SERVICE_QUERY_STATUS);
+    SERVICE_STATUS st{};
+    bool running = svc && QueryServiceStatus(svc, &st) && st.dwCurrentState == SERVICE_RUNNING;
+    if (svc) CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return running;
+}
+
+static bool MmfilterPresent() {
+    HANDLE h = CreateFileW(MM_DEVICE_PATH, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+static DWORD WINAPI EtwProcessThread(LPVOID trace) {
+    TRACEHANDLE h = (TRACEHANDLE)trace;
+    ProcessTrace(&h, 1, nullptr, nullptr);     // returns when the session stops
+    return 0;
+}
+
+// Starts the trace session; on success the session and trace handles are set.
+static bool EtwStart(TRACEHANDLE* session, TRACEHANDLE* trace) {
+    EtwControl(0, EVENT_TRACE_CONTROL_STOP);   // one left over from a crash
+    std::vector<BYTE> props = EtwProperties();
+    if (StartTraceW(session, kEtwSession, (EVENT_TRACE_PROPERTIES*)props.data()) != ERROR_SUCCESS) return false;
+    if (EnableTraceEx2(*session, &kBthPortProvider, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
+                       ~0ULL, 0, 0, nullptr) != ERROR_SUCCESS) {
+        EtwControl(*session, EVENT_TRACE_CONTROL_STOP);
+        return false;
+    }
+    EVENT_TRACE_LOGFILEW log{};
+    log.LoggerName = (LPWSTR)kEtwSession;
+    log.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    log.EventRecordCallback = EtwEvent;
+    *trace = OpenTraceW(&log);
+    if (*trace == INVALID_PROCESSTRACE_HANDLE) {
+        EtwControl(*session, EVENT_TRACE_CONTROL_STOP);
+        return false;
+    }
+    return true;
+}
+
+// Runs the trace while Apple's driver is on the mouse and mmfilter isn't, and keeps flushing
+// it so events arrive within milliseconds (a real-time session otherwise delivers about once
+// a second).
+static DWORD WINAPI BootCampThread(LPVOID) {
+    TRACEHANDLE session = 0, trace = INVALID_PROCESSTRACE_HANDLE;
+    HANDLE processor = nullptr;
+    ULONGLONG lastCheck = 0;
+    bool want = false, fastTimer = false;
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        if (now - lastCheck >= 2000) {
+            lastCheck = now;
+            g_bootCampDriver = ServiceRunning(L"applewirelessmouse");
+            want = g_bootCampDriver && g_elevated && !MmfilterPresent();
+            if (want && !processor && EtwStart(&session, &trace)) {
+                processor = CreateThread(nullptr, 0, EtwProcessThread, (LPVOID)trace, 0, nullptr);
+                SetThreadPriority(processor, THREAD_PRIORITY_ABOVE_NORMAL);
+                g_etwRunning = true;
+            }
+        }
+        bool active = now - g_etwFrameTick < 1500;
+        if (active != fastTimer) {
+            if (active) timeBeginPeriod(1);
+            else timeEndPeriod(1);
+            fastTimer = active;
+        }
+        bool stopping = WaitForSingleObject(g_stop, active ? kEtwFlushActiveMs : kEtwFlushIdleMs) == WAIT_OBJECT_0;
+        if (processor && (stopping || !want)) {
+            g_etwRunning = false;
+            EtwControl(session, EVENT_TRACE_CONTROL_STOP);
+            WaitForSingleObject(processor, 2000);
+            CloseHandle(processor);
+            CloseTrace(trace);
+            processor = nullptr;
+        }
+        if (stopping) break;
+        if (processor) EtwControl(session, EVENT_TRACE_CONTROL_FLUSH);
+    }
+    if (fastTimer) timeEndPeriod(1);
+    return 0;
+}
+
 static void PublishView(const Engine& engine, const Frame* f) {
     AcquireSRWLockExclusive(&g_viewLock);
     if (f) {
@@ -661,6 +866,50 @@ static void PublishView(const Engine& engine, const Frame* f) {
     g_view.glideSpeed = engine.GlideFingerSpeed();
     g_view.pinching = engine.Pinching();
     ReleaseSRWLockExclusive(&g_viewLock);
+}
+
+// Runs frames (from the driver or the Bluetooth log) through the engine.
+static void HandleFrames(Engine& engine, const MM_FRAME* frames, DWORD count, bool& pressed) {
+    EngineConfig cfg = g_set.Snapshot();
+    for (DWORD i = 0; i < count; i++) {
+        Frame f;
+        if (frames[i].Report[0] == kReportLift && frames[i].Length >= 2) {
+            g_lifted = frames[i].Report[1] != 0;     // 1 lifted off the desk, 0 put back down
+            PublishView(engine, nullptr);
+            continue;
+        }
+        if (!DecodeFrame(frames[i], &f)) continue;
+        if (f.dx || f.dy) g_lifted = false;     // the sensor is tracking: it's on the desk
+        engine.OnFrame(f, cfg);
+        if ((f.buttons != 0) != pressed) {
+            pressed = f.buttons != 0;
+            PostMessageW(g_tray, WM_TRAYDOT, pressed, 0);
+        }
+        g_fingers = engine.Fingers();
+        g_fingersTick = GetTickCount64();
+        PublishView(engine, &f);
+    }
+}
+
+// Boot Camp mode: frames from the Bluetooth log, until the trace stops. Returns TRUE if the
+// app is closing.
+static bool RunBootCamp(Engine& engine, std::vector<MM_FRAME>& frames, bool& pressed) {
+    while (g_etwRunning) {
+        HANDLE waits[2] = { g_etwReady, g_stop };
+        DWORD r = WaitForMultipleObjects(2, waits, FALSE, engine.NeedsTick() ? kGlideTickMs : 500);
+        if (r == WAIT_OBJECT_0 + 1) return true;
+        if (r == WAIT_TIMEOUT) {
+            if (engine.NeedsTick()) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                engine.Tick(now.QuadPart, g_set.Snapshot());
+                PublishView(engine, nullptr);
+            }
+            continue;
+        }
+        while (ULONG n = EtwTake(frames.data(), (ULONG)frames.size())) HandleFrames(engine, frames.data(), n, pressed);
+    }
+    return false;
 }
 
 static DWORD WINAPI EngineThread(LPVOID) {
@@ -675,12 +924,21 @@ static DWORD WINAPI EngineThread(LPVOID) {
     while (!stopping) {
         HANDLE h = CreateFileW(MM_DEVICE_PATH, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (h == INVALID_HANDLE_VALUE && g_etwRunning) {
+            g_source = SOURCE_BOOTCAMP;
+            SetConnected(true);
+            stopping = RunBootCamp(engine, frames, pressed);
+            engine.Cancel();
+            continue;
+        }
         if (h == INVALID_HANDLE_VALUE) {
+            g_source = SOURCE_NONE;
             SetConnected(false);
             g_lifted = false;
             if (WaitForSingleObject(g_stop, 2000) == WAIT_OBJECT_0) break;
             continue;
         }
+        g_source = SOURCE_DRIVER;
         SetConnected(true);
         SendDriverOptions();            // the driver forgets them when it reloads
 
@@ -710,25 +968,7 @@ static DWORD WINAPI EngineThread(LPVOID) {
                 break;
             }
             if (!GetOverlappedResult(h, &ov, &got, TRUE) || stopping) break;
-            EngineConfig cfg = g_set.Snapshot();
-            for (DWORD i = 0; i < got / sizeof(MM_FRAME); i++) {
-                Frame f;
-                if (frames[i].Report[0] == kReportLift && frames[i].Length >= 2) {
-                    g_lifted = frames[i].Report[1] != 0;     // 1 lifted off the desk, 0 put back down
-                    PublishView(engine, nullptr);
-                    continue;
-                }
-                if (!DecodeFrame(frames[i], &f)) continue;
-                if (f.dx || f.dy) g_lifted = false;     // the sensor is tracking: it's on the desk
-                engine.OnFrame(f, cfg);
-                if ((f.buttons != 0) != pressed) {
-                    pressed = f.buttons != 0;
-                    PostMessageW(g_tray, WM_TRAYDOT, pressed, 0);
-                }
-                g_fingers = engine.Fingers();
-                g_fingersTick = GetTickCount64();
-                PublishView(engine, &f);
-            }
+            HandleFrames(engine, frames.data(), got / sizeof(MM_FRAME), pressed);
         }
         engine.Cancel();    // driver gone (mouse removed / filter unloaded): end any pinch, then reopen
         CloseHandle(h);
@@ -756,6 +996,10 @@ static bool FromRealMouse(const MSLLHOOKSTRUCT* m) {
 static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && FromRealMouse((MSLLHOOKSTRUCT*)lp)) {
         if (wp == WM_MOUSEMOVE && g_pinchActive && GetTickCount64() - g_pinchTick < 300) return 1;   // hold still while pinching
+        // Boot Camp mode: Apple's driver scrolls from the same touches; ours replaces it. Other
+        // mice's wheels only lose out while a finger is on the Magic Mouse.
+        if ((wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL) && g_source == SOURCE_BOOTCAMP && g_set.enabled &&
+            GetTickCount64() - g_etwFrameTick < kAppleWheelHoldMs) return 1;
         bool down = wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN;
         if (down && !g_middleFor && g_set.enabled && g_set.twoFingerMiddle && g_fingers >= 2 &&
             GetTickCount64() - g_fingersTick < kFingersFreshMs) {
@@ -857,6 +1101,7 @@ static DWORD WINAPI StatusThread(LPVOID) {
         MM_STATUS s{};
         bool ok = DriverCall(IOCTL_MM_GET_STATUS, &s, sizeof(s));
         int state = !ok || !s.Attached ? MOUSE_SEARCHING : !s.InterruptOpen ? MOUSE_ASLEEP : MOUSE_AWAKE;
+        if (!ok && g_source == SOURCE_BOOTCAMP) state = g_etwAsleep ? MOUSE_ASLEEP : MOUSE_AWAKE;   // from the link's packets
         if (state != g_mouseState.exchange(state)) PostMessageW(g_tray, WM_MOUSESTATE, 0, 0);
         if (state != MOUSE_AWAKE) g_lifted = false;     // its last lift report may be stale on waking
         int level = s.Battery;              // -1 until the driver's first read
@@ -884,6 +1129,18 @@ static bool DriverCall(DWORD code, void* out, DWORD outLen) {
 
 static void ShowStatus(HWND hwnd) {
     MM_STATUS s{};
+    if (!DriverCall(IOCTL_MM_GET_STATUS, &s, sizeof(s)) && g_bootCampDriver) {
+        wchar_t text[640];
+        swprintf_s(text,
+            L"Boot Camp mode: Apple's applewirelessmouse driver is on the mouse (no mmfilter).\n\n"
+            L"Bluetooth trace: %s\nBluetooth packets seen: %lu\nTouch frames: %lu\nBlanked packets: %lu%s",
+            g_etwRunning ? L"running" : g_elevated ? L"not running (couldn't start it)" : L"needs the app to run as administrator",
+            g_etwEvents.load(), g_etwFrames.load(), g_etwScrubbed.load(),
+            g_etwScrubbed && !g_etwFrames ? L"\n\nWindows is blanking the packets' contents. Run \"mmdriver bootcamp\" "
+                                            L"(it turns full Bluetooth logging on), then turn Bluetooth off and on." : L"");
+        MessageBoxW(hwnd, text, L"MagicMouseNative status", MB_ICONINFORMATION);
+        return;
+    }
     if (!DriverCall(IOCTL_MM_GET_STATUS, &s, sizeof(s))) {
         MessageBoxW(hwnd, L"Can't reach mmfilter (\\\\.\\MagicMouseNative).\n\n"
                           L"Is the driver installed and the mouse paired?", kAppName, MB_ICONWARNING);
@@ -2101,10 +2358,14 @@ static void PaintWindow(HWND hwnd, HDC target) {
         DrawDeviceTitle(g, m, S(14));
         wchar_t status[128];
         int state = g_mouseState;
-        const wchar_t* what = !g_connected ? L"No Magic Mouse 2009 with the driver found"
+        bool bootCamp = g_source == SOURCE_BOOTCAMP;
+        const wchar_t* what = !g_connected && g_bootCampDriver && !g_elevated ? L"Boot Camp driver: run as administrator"
+                            : !g_connected ? L"No Magic Mouse with a driver found"
                             : state == MOUSE_ASLEEP ? L"Asleep \x2014 click the mouse to wake it"
                             : state == MOUSE_SEARCHING ? L"Looking for the mouse"
-                            : g_set.enabled ? L"Connected" : L"Paused";
+                            : bootCamp && g_etwScrubbed && !g_etwFrames ? L"Bluetooth log blanked: see Driver status"
+                            : !g_set.enabled ? L"Paused"
+                            : bootCamp ? L"Connected (Boot Camp driver)" : L"Connected";
         swprintf_s(status, L"%s%s", what, g_elevated ? L"   \x00B7   Administrator" : L"");
         Label(g, status, g_fonts.caption, p.subtext, gp::RectF(m, S(42), S(330), S(20)));
         DrawBattery(g, w / 2, S(22));
@@ -2232,7 +2493,10 @@ static void Activate(HWND hwnd, const Elem& e) {
         if (e.id == BTN_STATUS) ShowStatus(hwnd);
         else if (e.id == BTN_ELEVATE) RestartElevated(hwnd);
         else if (!DriverCall(IOCTL_MM_ENABLE_TOUCH, nullptr, 0))
-            MessageBoxW(hwnd, L"The driver couldn't resend D7 01 (is the mouse connected?).", kAppName, MB_ICONWARNING);
+            MessageBoxW(hwnd, g_source == SOURCE_BOOTCAMP ? L"In Boot Camp mode Apple's driver turns multi-touch on; "
+                                                            L"turning the mouse off and on makes it do that again."
+                                                          : L"The driver couldn't resend D7 01 (is the mouse connected?).",
+                        kAppName, MB_ICONWARNING);
         return;
     case E_PIN:
         g_onTop = !g_onTop;
@@ -2676,6 +2940,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     HANDLE hook = CreateThread(nullptr, 0, HookThread, nullptr, 0, &hookThreadId);
     SetThreadPriority(hook, THREAD_PRIORITY_TIME_CRITICAL);
     g_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_etwReady = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE bootCamp = CreateThread(nullptr, 0, BootCampThread, nullptr, 0, nullptr);
     HANDLE engine = CreateThread(nullptr, 0, EngineThread, nullptr, 0, nullptr);
     SetThreadPriority(engine, THREAD_PRIORITY_ABOVE_NORMAL);
     HANDLE battery = CreateThread(nullptr, 0, StatusThread, nullptr, 0, nullptr);
@@ -2697,8 +2963,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     CloseHandle(keyboard);
     if (g_middleFor) SendMouse(MOUSEEVENTF_MIDDLEUP);
     SetEvent(g_stop);
-    HANDLE threads[3] = { engine, battery, keyboardStatus };
-    WaitForMultipleObjects(3, threads, TRUE, 5000);
+    HANDLE threads[4] = { engine, battery, keyboardStatus, bootCamp };     // Boot Camp: stops the trace
+    WaitForMultipleObjects(4, threads, TRUE, 5000);
+    CloseHandle(bootCamp);
     CloseHandle(engine);
     CloseHandle(battery);
     CloseHandle(keyboardStatus);
